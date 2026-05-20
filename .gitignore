@@ -21,6 +21,7 @@ $RECYCLE.BIN/
 
 # Project-specific generated assets / binaries
 config.json
+.state/group-state.json
 
 # Misc
 *.log
