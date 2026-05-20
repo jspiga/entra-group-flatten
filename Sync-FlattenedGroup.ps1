@@ -90,9 +90,9 @@ function Write-Log {
 $config = @{}
 if (Test-Path $ConfigPath) {
     Write-Log "Loading config from '$ConfigPath'"
-    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json -AsHashtable
+    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json | ForEach-Object { $h = @{}; $_.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }; $h }
 } else {
-    Write-Log "No config.json found at '$ConfigPath' — relying on parameters only." "WARN"
+    Write-Log "No config.json found at '$ConfigPath' -- relying on parameters only." "WARN"
 }
 
 # Parameter values take precedence over config file
@@ -147,20 +147,20 @@ if (-not $targetGroupObj) {
 # ── Get flattened source members ──────────────────────────────────────────────
 
 Write-Log "Fetching transitive (flattened) members of source group '$SourceGroup'..."
-$flatMembers = Get-GroupTransitiveMembers -Headers $headers -GroupId $sourceGroupObj.id
+$flatMembers = @(Get-GroupTransitiveMembers -Headers $headers -GroupId $sourceGroupObj.id)
 
 # De-duplicate by ID (should already be unique from the API, but be safe)
-$uniqueMembers = $flatMembers | Sort-Object id -Unique
+$uniqueMembers = @($flatMembers | Sort-Object id -Unique)
 Write-Log "Found $($uniqueMembers.Count) unique user(s) in flattened source group." "SUCCESS"
 
-if ($Verbose) {
+if ($VerbosePreference -ne 'SilentlyContinue') {
     $uniqueMembers | ForEach-Object { Write-Verbose "  - $($_.userPrincipalName) ($($_.id))" }
 }
 
 # ── Get current target group members ─────────────────────────────────────────
 
 Write-Log "Fetching current members of target group '$TargetGroup'..."
-$currentMembers = Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id
+$currentMembers = @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
 $currentUserIds = @($currentMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })
 Write-Log "Target group currently has $($currentUserIds.Count) user member(s)."
 
@@ -168,18 +168,20 @@ Write-Log "Target group currently has $($currentUserIds.Count) user member(s)."
 
 $desiredIds = @($uniqueMembers | ForEach-Object { $_.id })
 
-$desiredSet = [System.Collections.Generic.HashSet[string]]::new($desiredIds,  [System.StringComparer]::OrdinalIgnoreCase)
-$actualSet  = [System.Collections.Generic.HashSet[string]]::new($currentUserIds, [System.StringComparer]::OrdinalIgnoreCase)
+$desiredSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($id in $desiredIds)     { $null = $desiredSet.Add($id) }
+$actualSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($id in $currentUserIds) { $null = $actualSet.Add($id) }
 
 $toAdd    = @($desiredSet | Where-Object { -not $actualSet.Contains($_) })
 $toRemove = @($actualSet  | Where-Object { -not $desiredSet.Contains($_) })
 
-Write-Log "Diff — To add: $($toAdd.Count)  |  To remove: $($toRemove.Count)  |  Unchanged: $($actualSet.Count - $toRemove.Count)"
+Write-Log "Diff -- To add: $($toAdd.Count)  |  To remove: $($toRemove.Count)  |  Unchanged: $($actualSet.Count - $toRemove.Count)"
 
 # ── Apply changes ─────────────────────────────────────────────────────────────
 
 if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
-    Write-Log "Target group is already up to date — no changes required." "SUCCESS"
+    Write-Log "Target group is already up to date -- no changes required." "SUCCESS"
 } else {
     if ($PSCmdlet.ShouldProcess($TargetGroup, "Sync group membership (add $($toAdd.Count), remove $($toRemove.Count))")) {
         if ($toAdd.Count -gt 0) {

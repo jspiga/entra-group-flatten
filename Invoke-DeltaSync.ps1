@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Version 3: Optimised group sync using Microsoft Graph delta queries.
 
@@ -48,7 +48,7 @@
     Discard all stored state and perform a full sync from scratch.
 
 .EXAMPLE
-    # Normal run — uses delta links if available
+    # Normal run -- uses delta links if available
     .\Invoke-DeltaSync.ps1 -SourceGroup "All-Engineering" -TargetGroup "EngineeringFlat"
 
 .EXAMPLE
@@ -101,7 +101,7 @@ function Write-Log {
 $config = @{}
 if (Test-Path $ConfigPath) {
     Write-Log "Loading config from '$ConfigPath'"
-    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json -AsHashtable
+    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json | ForEach-Object { $h = @{}; $_.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }; $h }
 }
 
 if (-not $TenantId)     { $TenantId     = $config["tenantId"]     }
@@ -152,7 +152,7 @@ Write-Log "Source group: '$($sourceGroupObj.displayName)' (ID: $($sourceGroupObj
 Write-Log "Resolving target group: '$TargetGroup'"
 $targetGroupObj = Get-GroupByName -Headers $headers -DisplayName $TargetGroup
 if (-not $targetGroupObj) {
-    Write-Log "Target group '$TargetGroup' not found — creating..." "WARN"
+    Write-Log "Target group '$TargetGroup' not found -- creating..." "WARN"
     $targetGroupObj = New-EntraGroup -Headers $headers -DisplayName $TargetGroup `
         -Description "Flattened membership of '$SourceGroup', managed by Invoke-DeltaSync.ps1"
 }
@@ -186,8 +186,10 @@ foreach ($groupId in $groupIds) {
 
         # Filter to user objects only (nested groups will be in transitive members, handled separately)
         $userMembers = @($deltaResult.Changes | Where-Object {
-            $_.'@odata.type' -eq '#microsoft.graph.user' -or
-            (-not $_.'@odata.type' -and -not $_.'@removed')
+            $odataType = $_.PSObject.Properties['@odata.type']
+            $removed   = $_.PSObject.Properties['@removed']
+            ($odataType -and $odataType.Value -eq '#microsoft.graph.user') -or
+            (-not $odataType -and -not $removed)
         })
 
         Set-TrackedMembers -State $state -GroupId $groupId -Members $userMembers
@@ -213,19 +215,21 @@ foreach ($groupId in $groupIds) {
         foreach ($change in $deltaResult.Changes) {
             if (-not $change.id) { continue }
 
-            if ($change.'@removed') {
+            $changeRemoved   = $change.PSObject.Properties['@removed']
+            $changeOdataType = $change.PSObject.Properties['@odata.type']
+            if ($changeRemoved) {
                 # Member was removed from the group
                 if ($memberMap.ContainsKey($change.id)) {
                     $memberMap.Remove($change.id) | Out-Null
                     $removed++
                 }
             }
-            elseif ($change.'@odata.type' -eq '#microsoft.graph.user' -or -not $change.'@odata.type') {
-                # Member was added or updated — upsert
+            elseif ((-not $changeOdataType) -or $changeOdataType.Value -eq '#microsoft.graph.user') {
+                # Member was added or updated -- upsert
                 $memberMap[$change.id] = $change
                 $added++
             }
-            # Ignore nested group changes — transitive membership is handled at the aggregate level
+            # Ignore nested group changes -- transitive membership is handled at the aggregate level
         }
 
         $updatedMembers = @($memberMap.Values)
@@ -252,34 +256,34 @@ Write-Log "Desired flattened membership: $($desiredSet.Count) unique user(s)." "
 
 # ── Load tracked target membership ────────────────────────────────────────────
 
-$trackedTargetIds = [System.Collections.Generic.HashSet[string]]::new(
-    @($state.targetMembers | ForEach-Object { if ($_ -is [string]) { $_ } else { $_.id } }),
-    [System.StringComparer]::OrdinalIgnoreCase
-)
+$trackedTargetIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($tm in @($state.targetMembers | ForEach-Object { if ($_ -is [string]) { $_ } else { $_.id } })) {
+    if ($tm) { $null = $trackedTargetIds.Add($tm) }
+}
 
 # ── Compute diff against tracked target state ─────────────────────────────────
 
 $toAdd    = @($desiredSet      | Where-Object { -not $trackedTargetIds.Contains($_) })
 $toRemove = @($trackedTargetIds | Where-Object { -not $desiredSet.Contains($_) })
 
-Write-Log "Diff vs tracked target — Add: $($toAdd.Count)  |  Remove: $($toRemove.Count)"
+Write-Log "Diff vs tracked target -- Add: $($toAdd.Count)  |  Remove: $($toRemove.Count)"
 
 if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
-    Write-Log "No change in flattened membership since last run — target group update skipped." "SUCCESS"
+    Write-Log "No change in flattened membership since last run -- target group update skipped." "SUCCESS"
 }
 else {
     # Verify actual live target membership before mutating (guard against out-of-band changes)
     Write-Log "Fetching live target group membership for final verification..."
     $liveMembers = Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id
-    $liveIds     = [System.Collections.Generic.HashSet[string]]::new(
-        @($liveMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } | ForEach-Object { $_.id }),
-        [System.StringComparer]::OrdinalIgnoreCase
-    )
+    $liveIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($lid in @($liveMembers | Where-Object { $p = $_.PSObject.Properties['@odata.type']; -not $p -or $p.Value -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })) {
+        if ($lid) { $null = $liveIds.Add($lid) }
+    }
 
     $liveToAdd    = @($desiredSet | Where-Object { -not $liveIds.Contains($_) })
     $liveToRemove = @($liveIds    | Where-Object { -not $desiredSet.Contains($_) })
 
-    Write-Log "Live diff — Add: $($liveToAdd.Count)  |  Remove: $($liveToRemove.Count)"
+    Write-Log "Live diff -- Add: $($liveToAdd.Count)  |  Remove: $($liveToRemove.Count)"
 
     if ($liveToAdd.Count -gt 0) {
         Write-Log "Adding $($liveToAdd.Count) member(s) to '$TargetGroup'..."

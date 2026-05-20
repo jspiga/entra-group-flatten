@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Shared Microsoft Graph API helper functions for Entra ID group operations.
 
@@ -101,7 +101,7 @@ function Invoke-GraphRequest {
 
                 if ($attempt -le $MaxRetries) {
                     $wait = [Math]::Max($retryAfter, [Math]::Pow(2, $attempt))
-                    Write-Warning "[GraphGroups] HTTP $statusCode on $Method $Uri — retrying in ${wait}s (attempt $attempt/$MaxRetries)"
+                    Write-Warning "[GraphGroups] HTTP $statusCode on $Method $Uri -- retrying in ${wait}s (attempt $attempt/$MaxRetries)"
                     Start-Sleep -Seconds $wait
                     continue
                 }
@@ -137,10 +137,11 @@ function Get-GraphPagedResults {
 
     while ($nextUri) {
         $response = Invoke-GraphRequest -Headers $Headers -Method GET -Uri $nextUri
-        if ($response.value) {
+        if ($response.PSObject.Properties['value'] -and $response.value) {
             foreach ($item in $response.value) { $results.Add($item) }
         }
-        $nextUri = $response.'@odata.nextLink'
+        $nextLinkProp = $response.PSObject.Properties['@odata.nextLink']
+        $nextUri = if ($nextLinkProp) { $nextLinkProp.Value } else { $null }
     }
 
     return $results.ToArray()
@@ -159,7 +160,7 @@ function Resolve-TargetGroupName {
         The target group name as supplied by the user.
 
     .PARAMETER Prefix
-        The prefix string from config (may be null/empty — in which case Name is returned unchanged).
+        The prefix string from config (may be null/empty -- in which case Name is returned unchanged).
     #>
     [CmdletBinding()]
     param(
@@ -174,7 +175,7 @@ function Resolve-TargetGroupName {
     }
 
     if ($Name.StartsWith($Prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-Verbose "[GraphGroups] Target group name '$Name' already has prefix '$Prefix' — no change."
+        Write-Verbose "[GraphGroups] Target group name '$Name' already has prefix '$Prefix' -- no change."
         return $Name
     }
 
@@ -292,7 +293,7 @@ function Get-GroupTransitiveMembers {
 
     Write-Verbose "[GraphGroups] Getting transitive members of group '$GroupId'"
     $uri = "$script:GraphBaseUrl/groups/$GroupId/transitiveMembers/microsoft.graph.user?`$select=id,displayName,userPrincipalName"
-    $members = Get-GraphPagedResults -Headers $Headers -Uri $uri
+    $members = @(Get-GraphPagedResults -Headers $Headers -Uri $uri)
     Write-Verbose "[GraphGroups] Found $($members.Count) transitive user members"
     return $members
 }
@@ -318,8 +319,8 @@ function Get-GroupMembers {
     )
 
     Write-Verbose "[GraphGroups] Getting direct members of group '$GroupId'"
-    $uri = "$script:GraphBaseUrl/groups/$GroupId/members?`$select=id,displayName,userPrincipalName,`@odata.type"
-    return Get-GraphPagedResults -Headers $Headers -Uri $uri
+    $uri = "$script:GraphBaseUrl/groups/$GroupId/members?`$select=id,displayName,userPrincipalName"
+    return @(Get-GraphPagedResults -Headers $Headers -Uri $uri)
 }
 
 function Get-NestedGroupIds {
@@ -345,7 +346,7 @@ function Get-NestedGroupIds {
 
     Write-Verbose "[GraphGroups] Getting nested group IDs within group '$GroupId'"
     $uri = "$script:GraphBaseUrl/groups/$GroupId/transitiveMembers/microsoft.graph.group?`$select=id,displayName"
-    $nestedGroups = Get-GraphPagedResults -Headers $Headers -Uri $uri
+    $nestedGroups = @(Get-GraphPagedResults -Headers $Headers -Uri $uri)
 
     # Always include the root group itself
     $ids = @($GroupId) + ($nestedGroups | ForEach-Object { $_.id })
@@ -490,13 +491,13 @@ function Sync-GroupMembership {
     $toAdd    = @($desiredSet | Where-Object { -not $actualSet.Contains($_) })
     $toRemove = @($actualSet  | Where-Object { -not $desiredSet.Contains($_) })
 
-    Write-Host "[INFO] Sync summary — Add: $($toAdd.Count)  Remove: $($toRemove.Count)  Unchanged: $($actualSet.Count - $toRemove.Count)" -ForegroundColor Cyan
+    Write-Host "[INFO] Sync summary -- Add: $($toAdd.Count)  Remove: $($toRemove.Count)  Unchanged: $($actualSet.Count - $toRemove.Count)" -ForegroundColor Cyan
 
     if ($toAdd.Count -gt 0)    { Add-GroupMembers    -Headers $Headers -GroupId $GroupId -MemberIds $toAdd }
     if ($toRemove.Count -gt 0) { Remove-GroupMembers -Headers $Headers -GroupId $GroupId -MemberIds $toRemove }
 
     if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
-        Write-Host "[INFO] Target group membership is already up to date — no changes needed." -ForegroundColor Green
+        Write-Host "[INFO] Target group membership is already up to date -- no changes needed." -ForegroundColor Green
     }
 }
 
@@ -537,29 +538,45 @@ function Get-GroupMembersDelta {
         [string]$DeltaLink = $null
     )
 
-    $startUri = $DeltaLink ?? "$script:GraphBaseUrl/groups/$GroupId/members/delta?`$select=id,displayName,userPrincipalName"
+    $startUri = if ($DeltaLink) { $DeltaLink } else { "$script:GraphBaseUrl/groups/$GroupId/members/microsoft.graph.user/delta" }
 
     $allChanges = [System.Collections.Generic.List[object]]::new()
     $nextUri    = $startUri
     $deltaLink  = $null
 
-    while ($nextUri) {
-        $response = Invoke-GraphRequest -Headers $Headers -Method GET -Uri $nextUri
+    try {
+        while ($nextUri) {
+            $response = Invoke-GraphRequest -Headers $Headers -Method GET -Uri $nextUri
 
-        if ($response.value) {
-            foreach ($item in $response.value) { $allChanges.Add($item) }
-        }
+            if ($response.PSObject.Properties['value'] -and $response.value) {
+                foreach ($item in $response.value) { $allChanges.Add($item) }
+            }
 
-        if ($response.'@odata.deltaLink') {
-            $deltaLink = $response.'@odata.deltaLink'
-            $nextUri   = $null
+            $deltaLinkProp = $response.PSObject.Properties['@odata.deltaLink']
+            $nextLinkProp2 = $response.PSObject.Properties['@odata.nextLink']
+            if ($deltaLinkProp) {
+                $deltaLink = $deltaLinkProp.Value
+                $nextUri   = $null
+            }
+            elseif ($nextLinkProp2) {
+                $nextUri = $nextLinkProp2.Value
+            }
+            else {
+                $nextUri = $null
+            }
         }
-        elseif ($response.'@odata.nextLink') {
-            $nextUri = $response.'@odata.nextLink'
+    }
+    catch {
+        # Delta queries are not supported for all group types -- fall back to full member fetch
+        if ($_ -match 'Change tracking is not supported' -or $_ -match 'HTTP 400') {
+            Write-Warning "[GraphGroups] Delta query not supported for group '$GroupId' -- falling back to full member fetch."
+            $members = @(Get-GraphPagedResults -Headers $Headers -Uri "$script:GraphBaseUrl/groups/$GroupId/members/microsoft.graph.user?`$select=id,displayName,userPrincipalName")
+            return @{
+                Changes   = $members
+                DeltaLink = $null   # No delta link -- will force full sync next run too
+            }
         }
-        else {
-            $nextUri = $null
-        }
+        throw
     }
 
     return @{

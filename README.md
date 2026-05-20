@@ -30,11 +30,11 @@ Flattens a nested Entra ID (Azure AD) security group and keeps a target group sy
 
 ## App Registration Setup
 
-1. In the [Azure Portal](https://portal.azure.com), go to **Azure Active Directory → App registrations → New registration**.
-2. Give it a name (e.g. `EntraGroupFlattenScript`), select **Accounts in this organisational directory only**, and click **Register**.
+1. In the [Azure Portal](https://portal.azure.com), go to **Microsoft Entra ID → Manage → App registrations → New registration**.
+2. Give it a name (e.g. `EntraGroupFlattenScript`), select **Accounts in this organisational directory only** or **Single tenant only - Default Directory**, and click **Register**.
 3. Note the **Application (client) ID** and **Directory (tenant) ID**.
-4. Go to **Certificates & secrets → New client secret**. Copy the secret value immediately.
-5. Go to **API permissions → Add a permission → Microsoft Graph → Application permissions** and add the permissions listed below. Click **Grant admin consent**.
+4. Go to **Manage → Certificates & secrets → New client secret** and create a new secret. Copy the secret value immediately.
+5. Go to **Manage → API permissions → Add a permission → Microsoft Graph → Application permissions** and add the permissions listed below. Click **Grant admin consent**.
 
 ---
 

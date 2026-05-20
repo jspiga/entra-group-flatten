@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Version 2: Registers Microsoft Graph change notification subscriptions for a source group
     and all of its nested sub-groups, so that membership changes trigger the webhook endpoint.
@@ -81,7 +81,7 @@ function Write-Log {
 $config = @{}
 if (Test-Path $ConfigPath) {
     Write-Log "Loading config from '$ConfigPath'"
-    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json -AsHashtable
+    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json | ForEach-Object { $h = @{}; $_.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }; $h }
 }
 
 if (-not $TenantId)       { $TenantId        = $config["tenantId"]              }
@@ -121,7 +121,7 @@ Write-Log "Found $($groupIds.Count) group(s) to subscribe (including root)." "SU
 $subscriptionStore = @{}
 if (Test-Path $SubscriptionStorePath) {
     Write-Log "Loading existing subscription records from '$SubscriptionStorePath'"
-    $subscriptionStore = Get-Content $SubscriptionStorePath -Raw | ConvertFrom-Json -AsHashtable
+    $subscriptionStore = Get-Content $SubscriptionStorePath -Raw | ConvertFrom-Json | ForEach-Object { $h = @{}; $_.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }; $h }
 }
 
 # ── Create or renew subscriptions ─────────────────────────────────────────────
@@ -148,7 +148,7 @@ foreach ($groupId in $groupIds) {
             continue
         }
         catch {
-            Write-Log "Failed to renew subscription '$existingSubId' — will create a new one. ($_)" "WARN"
+            Write-Log "Failed to renew subscription '$existingSubId' -- will create a new one. ($_)" "WARN"
         }
     }
 

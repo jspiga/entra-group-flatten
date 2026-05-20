@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Version 2: Starts a local HTTP listener that receives Microsoft Graph change notifications
     and triggers Sync-FlattenedGroup.ps1 (or Invoke-DeltaSync.ps1 for V3) on receipt.
@@ -96,7 +96,7 @@ function Write-Log {
 
 $config = @{}
 if (Test-Path $ConfigPath) {
-    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json -AsHashtable
+    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json | ForEach-Object { $h = @{}; $_.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }; $h }
 }
 
 if (-not $TenantId)     { $TenantId     = $config["tenantId"]     }
@@ -146,7 +146,7 @@ try {
             # When a new subscription is created, Graph sends a GET with ?validationToken=...
             if ($request.HttpMethod -eq "GET" -and $request.QueryString["validationToken"]) {
                 $token = $request.QueryString["validationToken"]
-                Write-Log "Received validation request — echoing token."
+                Write-Log "Received validation request -- echoing token."
                 $bytes = [System.Text.Encoding]::UTF8.GetBytes($token)
                 $response.ContentType   = "text/plain"
                 $response.StatusCode    = 200
@@ -182,7 +182,7 @@ try {
                     }
 
                     if (-not $validNotification) {
-                        Write-Log "Notification ignored — clientState does not match expected pattern." "WARN"
+                        Write-Log "Notification ignored -- clientState does not match expected pattern." "WARN"
                         continue
                     }
                 }

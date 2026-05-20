@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Shared state persistence helper for delta query tracking (Version 3).
 
@@ -35,14 +35,17 @@ function Read-State {
         Write-Verbose "[StateStore] Reading state from '$Path'"
         try {
             $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
-            return $raw | ConvertFrom-Json -AsHashtable
+            $parsed = $raw | ConvertFrom-Json
+            $h = @{}
+            $parsed.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }
+            return $h
         }
         catch {
             Write-Warning "[StateStore] Failed to parse state file '$Path': $($_.Exception.Message). Starting with empty state."
         }
     }
     else {
-        Write-Verbose "[StateStore] State file '$Path' not found — initialising empty state."
+        Write-Verbose "[StateStore] State file '$Path' not found -- initialising empty state."
     }
 
     return @{
@@ -130,12 +133,18 @@ function Set-DeltaLink {
         [Parameter(Mandatory)]
         [string]$GroupId,
 
-        [Parameter(Mandatory)]
-        [string]$DeltaLink
+        [string]$DeltaLink = $null
     )
 
     if (-not $State.deltaLinks) { $State.deltaLinks = @{} }
-    $State.deltaLinks[$GroupId] = $DeltaLink
+    if ($DeltaLink) {
+        $State.deltaLinks[$GroupId] = $DeltaLink
+    } else {
+        # No delta link (e.g. group doesn't support delta queries) -- remove any stored link
+        if ($State.deltaLinks.ContainsKey($GroupId)) {
+            $State.deltaLinks.Remove($GroupId)
+        }
+    }
 }
 
 function Get-TrackedMembers {
@@ -186,8 +195,8 @@ function Set-TrackedMembers {
         [Parameter(Mandatory)]
         [string]$GroupId,
 
-        [Parameter(Mandatory)]
-        [array]$Members
+        [AllowEmptyCollection()]
+        [array]$Members = @()
     )
 
     if (-not $State.trackedMembers) { $State.trackedMembers = @{} }
