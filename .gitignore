@@ -1,0 +1,28 @@
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.history/
+
+# OS-generated files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+Desktop.ini
+Thumbs.db
+$RECYCLE.BIN/
+
+# Project-specific generated assets / binaries
+config.json
+
+# Misc
+*.log
+.tmp/
+tmp/
