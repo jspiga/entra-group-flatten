@@ -2,7 +2,9 @@
   "tenantId": "your-tenant-id-here",
   "clientId": "your-app-registration-client-id",
   "clientSecret": "your-client-secret-here",
-  "targetGroupPrefix": "ATL_",
+  "targetGroupPrefix": "FLAT_",
   "webhookNotificationUrl": "https://your-endpoint.example.com/notify",
-  "stateFilePath": "./state/group-state.json"
+  "stateFilePath": "./state/group-state.json",
+  "groupRegistryPath": "./state/group-registry.json",
+  "subscriptionStorePath": "./state/subscriptions.json"
 }

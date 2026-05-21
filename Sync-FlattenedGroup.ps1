@@ -39,7 +39,7 @@
 
 .EXAMPLE
     # Fully explicit, override all config values
-    .\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "ATL_EngineeringFlat" `
+    .\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat" `
         -TenantId "..." -ClientId "..." -ClientSecret "..."
 
 .EXAMPLE

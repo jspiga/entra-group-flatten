@@ -485,8 +485,10 @@ function Sync-GroupMembership {
         $ActualMemberIds = @($currentMembers | ForEach-Object { $_.id })
     }
 
-    $desiredSet = [System.Collections.Generic.HashSet[string]]::new($DesiredMemberIds, [System.StringComparer]::OrdinalIgnoreCase)
-    $actualSet  = [System.Collections.Generic.HashSet[string]]::new($ActualMemberIds,  [System.StringComparer]::OrdinalIgnoreCase)
+    $desiredSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in $DesiredMemberIds) { if ($id) { $null = $desiredSet.Add($id) } }
+    $actualSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in $ActualMemberIds)  { if ($id) { $null = $actualSet.Add($id) } }
 
     $toAdd    = @($desiredSet | Where-Object { -not $actualSet.Contains($_) })
     $toRemove = @($actualSet  | Where-Object { -not $desiredSet.Contains($_) })
