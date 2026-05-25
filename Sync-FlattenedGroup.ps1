@@ -131,11 +131,13 @@ Write-Log "Source group resolved: '$($sourceGroupObj.displayName)' (ID: $($sourc
 Write-Log "Resolving target group: '$TargetGroup'"
 $targetGroupObj = Get-GroupByName -Headers $headers -DisplayName $TargetGroup
 
+$targetGroupIsNew = $false
 if (-not $targetGroupObj) {
     Write-Log "Target group '$TargetGroup' not found." "WARN"
     if ($PSCmdlet.ShouldProcess($TargetGroup, "Create new Entra ID security group")) {
-        $targetGroupObj = New-EntraGroup -Headers $headers -DisplayName $TargetGroup `
+        $targetGroupObj  = New-EntraGroup -Headers $headers -DisplayName $TargetGroup `
             -Description "Flattened membership of '$SourceGroup', managed by Sync-FlattenedGroup.ps1"
+        $targetGroupIsNew = $true
     } else {
         Write-Log "[WhatIf] Would create group '$TargetGroup'" "WARN"
         exit 0
@@ -159,10 +161,15 @@ if ($VerbosePreference -ne 'SilentlyContinue') {
 
 # ── Get current target group members ─────────────────────────────────────────
 
-Write-Log "Fetching current members of target group '$TargetGroup'..."
-$currentMembers = @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
-$currentUserIds = @($currentMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })
-Write-Log "Target group currently has $($currentUserIds.Count) user member(s)."
+if ($targetGroupIsNew) {
+    Write-Log "Target group '$TargetGroup' was just created -- skipping member fetch (empty by definition)."
+    $currentUserIds = @()
+} else {
+    Write-Log "Fetching current members of target group '$TargetGroup'..."
+    $currentMembers = @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
+    $currentUserIds = @($currentMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })
+    Write-Log "Target group currently has $($currentUserIds.Count) user member(s)."
+}
 
 # ── Compute diff ──────────────────────────────────────────────────────────────
 

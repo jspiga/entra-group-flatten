@@ -36,9 +36,34 @@ function Read-State {
         try {
             $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
             $parsed = $raw | ConvertFrom-Json
-            $h = @{}
-            $parsed.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }
-            return $h
+
+            # Deep-convert PSCustomObject -> hashtable for nested properties
+            # so that .ContainsKey() works throughout the state object
+            function ConvertTo-DeepHashtable {
+                param($obj)
+                if ($obj -is [System.Management.Automation.PSCustomObject]) {
+                    $h = @{}
+                    $obj.PSObject.Properties | ForEach-Object {
+                        $h[$_.Name] = ConvertTo-DeepHashtable $_.Value
+                    }
+                    return $h
+                }
+                elseif ($obj -is [System.Array]) {
+                    return @($obj | ForEach-Object { ConvertTo-DeepHashtable $_ })
+                }
+                else {
+                    return $obj
+                }
+            }
+
+            $state = ConvertTo-DeepHashtable $parsed
+
+            # Ensure required keys exist with correct types
+            if (-not $state.ContainsKey('deltaLinks'))     { $state['deltaLinks']     = @{} }
+            if (-not $state.ContainsKey('trackedMembers')) { $state['trackedMembers'] = @{} }
+            if (-not $state.ContainsKey('targetMembers'))  { $state['targetMembers']  = @() }
+
+            return $state
         }
         catch {
             Write-Warning "[StateStore] Failed to parse state file '$Path': $($_.Exception.Message). Starting with empty state."

@@ -387,16 +387,39 @@ function Add-GroupMembers {
     if ($MemberIds.Count -eq 0) { return }
 
     # Graph supports up to 20 members per PATCH members/$ref add
-    $batchSize = 20
-    $total = $MemberIds.Count
-    $added = 0
+    $batchSize  = 20
+    $total      = $MemberIds.Count
+    $added      = 0
+    $maxRetries = 5
+    $retryDelaySecs = 5
 
     for ($i = 0; $i -lt $total; $i += $batchSize) {
         $batch = $MemberIds[$i..([Math]::Min($i + $batchSize - 1, $total - 1))]
         $body = @{
             "members@odata.bind" = @($batch | ForEach-Object { "$script:GraphBaseUrl/directoryObjects/$_" })
         }
-        Invoke-GraphRequest -Headers $Headers -Method PATCH -Uri "$script:GraphBaseUrl/groups/$GroupId" -Body $body | Out-Null
+        $uri = "$script:GraphBaseUrl/groups/$GroupId"
+
+        $attempt = 0
+        $success = $false
+        while (-not $success -and $attempt -lt $maxRetries) {
+            try {
+                Invoke-GraphRequest -Headers $Headers -Method PATCH -Uri $uri -Body $body | Out-Null
+                $success = $true
+            }
+            catch {
+                # Newly created groups can return 404 briefly due to Entra ID propagation delay
+                if ($_ -match 'HTTP 404' -and $attempt -lt ($maxRetries - 1)) {
+                    $attempt++
+                    $wait = $retryDelaySecs * $attempt
+                    Write-Host "[INFO] Group '$GroupId' not yet reachable (404) -- retrying in ${wait}s (attempt $attempt/$maxRetries)..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds $wait
+                } else {
+                    throw
+                }
+            }
+        }
+
         $added += $batch.Count
         Write-Verbose "[GraphGroups] Added $added/$total members to group '$GroupId'"
     }

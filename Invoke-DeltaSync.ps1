@@ -150,11 +150,13 @@ Write-Log "Source group: '$($sourceGroupObj.displayName)' (ID: $($sourceGroupObj
 # ── Resolve or create target group ────────────────────────────────────────────
 
 Write-Log "Resolving target group: '$TargetGroup'"
-$targetGroupObj = Get-GroupByName -Headers $headers -DisplayName $TargetGroup
+$targetGroupObj  = Get-GroupByName -Headers $headers -DisplayName $TargetGroup
+$targetGroupIsNew = $false
 if (-not $targetGroupObj) {
     Write-Log "Target group '$TargetGroup' not found -- creating..." "WARN"
-    $targetGroupObj = New-EntraGroup -Headers $headers -DisplayName $TargetGroup `
+    $targetGroupObj  = New-EntraGroup -Headers $headers -DisplayName $TargetGroup `
         -Description "Flattened membership of '$SourceGroup', managed by Invoke-DeltaSync.ps1"
+    $targetGroupIsNew = $true
 }
 Write-Log "Target group: '$($targetGroupObj.displayName)' (ID: $($targetGroupObj.id))" "SUCCESS"
 
@@ -273,8 +275,9 @@ if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
 }
 else {
     # Verify actual live target membership before mutating (guard against out-of-band changes)
+    # Skip live fetch if the group was just created (empty by definition, avoids 404 propagation delay)
     Write-Log "Fetching live target group membership for final verification..."
-    $liveMembers = Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id
+    $liveMembers = if ($targetGroupIsNew) { @() } else { Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id }
     $liveIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($lid in @($liveMembers | Where-Object { $p = $_.PSObject.Properties['@odata.type']; -not $p -or $p.Value -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })) {
         if ($lid) { $null = $liveIds.Add($lid) }
