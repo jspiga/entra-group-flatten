@@ -50,10 +50,10 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)]
-    [string]$SourceGroup,
+    [string[]]$SourceGroup,
 
     [Parameter(Mandatory)]
-    [string]$TargetGroup,
+    [string[]]$TargetGroup,
 
     [string]$TenantId,
     [string]$ClientId,
@@ -107,100 +107,112 @@ foreach ($required in @("TenantId","ClientId","ClientSecret")) {
     }
 }
 
-# ── Resolve target group name (apply prefix if needed) ───────────────────────
+# ── Validate inputs ───────────────────────────────────────────────────────────
 
-$TargetGroup = Resolve-TargetGroupName -Name $TargetGroup -Prefix $prefix
+if ($SourceGroup.Count -ne $TargetGroup.Count) {
+    throw "SourceGroup and TargetGroup arrays must have the same number of entries (got $($SourceGroup.Count) source(s) and $($TargetGroup.Count) target(s))."
+}
 
-# ── Authenticate ─────────────────────────────────────────────────────────────
+# ── Authenticate (once, shared across all group pairs) ───────────────────────
 
 Write-Log "Authenticating to Microsoft Graph (tenant: $TenantId)"
 $headers = Get-GraphHeaders -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 Write-Log "Authentication successful." "SUCCESS"
 
-# ── Resolve source group ──────────────────────────────────────────────────────
+# ── Process each source/target group pair ─────────────────────────────────────
 
-Write-Log "Resolving source group: '$SourceGroup'"
-$sourceGroupObj = Get-GroupByName -Headers $headers -DisplayName $SourceGroup
-if (-not $sourceGroupObj) {
-    throw "Source group '$SourceGroup' was not found in Entra ID."
-}
-Write-Log "Source group resolved: '$($sourceGroupObj.displayName)' (ID: $($sourceGroupObj.id))" "SUCCESS"
+for ($i = 0; $i -lt $SourceGroup.Count; $i++) {
+    $srcName = $SourceGroup[$i]
+    $tgtName = Resolve-TargetGroupName -Name $TargetGroup[$i] -Prefix $prefix
 
-# ── Resolve or create target group ────────────────────────────────────────────
+    Write-Log "--- [$($i+1)/$($SourceGroup.Count)] '$srcName' -> '$tgtName' ---"
 
-Write-Log "Resolving target group: '$TargetGroup'"
-$targetGroupObj = Get-GroupByName -Headers $headers -DisplayName $TargetGroup
+    # ── Resolve source group ──────────────────────────────────────────────────
 
-$targetGroupIsNew = $false
-if (-not $targetGroupObj) {
-    Write-Log "Target group '$TargetGroup' not found." "WARN"
-    if ($PSCmdlet.ShouldProcess($TargetGroup, "Create new Entra ID security group")) {
-        $targetGroupObj  = New-EntraGroup -Headers $headers -DisplayName $TargetGroup `
-            -Description "Flattened membership of '$SourceGroup', managed by Sync-FlattenedGroup.ps1"
-        $targetGroupIsNew = $true
-    } else {
-        Write-Log "[WhatIf] Would create group '$TargetGroup'" "WARN"
-        exit 0
+    Write-Log "Resolving source group: '$srcName'"
+    $sourceGroupObj = Get-GroupByName -Headers $headers -DisplayName $srcName
+    if (-not $sourceGroupObj) {
+        Write-Log "Source group '$srcName' was not found in Entra ID -- skipping." "ERROR"
+        continue
     }
-} else {
-    Write-Log "Target group resolved: '$($targetGroupObj.displayName)' (ID: $($targetGroupObj.id))" "SUCCESS"
-}
+    Write-Log "Source group resolved: '$($sourceGroupObj.displayName)' (ID: $($sourceGroupObj.id))" "SUCCESS"
 
-# ── Get flattened source members ──────────────────────────────────────────────
+    # ── Resolve or create target group ────────────────────────────────────────
 
-Write-Log "Fetching transitive (flattened) members of source group '$SourceGroup'..."
-$flatMembers = @(Get-GroupTransitiveMembers -Headers $headers -GroupId $sourceGroupObj.id)
+    Write-Log "Resolving target group: '$tgtName'"
+    $targetGroupObj  = Get-GroupByName -Headers $headers -DisplayName $tgtName
+    $targetGroupIsNew = $false
 
-# De-duplicate by ID (should already be unique from the API, but be safe)
-$uniqueMembers = @($flatMembers | Sort-Object id -Unique)
-Write-Log "Found $($uniqueMembers.Count) unique user(s) in flattened source group." "SUCCESS"
-
-if ($VerbosePreference -ne 'SilentlyContinue') {
-    $uniqueMembers | ForEach-Object { Write-Verbose "  - $($_.userPrincipalName) ($($_.id))" }
-}
-
-# ── Get current target group members ─────────────────────────────────────────
-
-if ($targetGroupIsNew) {
-    Write-Log "Target group '$TargetGroup' was just created -- skipping member fetch (empty by definition)."
-    $currentUserIds = @()
-} else {
-    Write-Log "Fetching current members of target group '$TargetGroup'..."
-    $currentMembers = @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
-    $currentUserIds = @($currentMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })
-    Write-Log "Target group currently has $($currentUserIds.Count) user member(s)."
-}
-
-# ── Compute diff ──────────────────────────────────────────────────────────────
-
-$desiredIds = @($uniqueMembers | ForEach-Object { $_.id })
-
-$desiredSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($id in $desiredIds)     { $null = $desiredSet.Add($id) }
-$actualSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($id in $currentUserIds) { $null = $actualSet.Add($id) }
-
-$toAdd    = @($desiredSet | Where-Object { -not $actualSet.Contains($_) })
-$toRemove = @($actualSet  | Where-Object { -not $desiredSet.Contains($_) })
-
-Write-Log "Diff -- To add: $($toAdd.Count)  |  To remove: $($toRemove.Count)  |  Unchanged: $($actualSet.Count - $toRemove.Count)"
-
-# ── Apply changes ─────────────────────────────────────────────────────────────
-
-if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
-    Write-Log "Target group is already up to date -- no changes required." "SUCCESS"
-} else {
-    if ($PSCmdlet.ShouldProcess($TargetGroup, "Sync group membership (add $($toAdd.Count), remove $($toRemove.Count))")) {
-        if ($toAdd.Count -gt 0) {
-            Write-Log "Adding $($toAdd.Count) member(s) to '$TargetGroup'..."
-            Add-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $toAdd
+    if (-not $targetGroupObj) {
+        Write-Log "Target group '$tgtName' not found." "WARN"
+        if ($PSCmdlet.ShouldProcess($tgtName, "Create new Entra ID security group")) {
+            $targetGroupObj   = New-EntraGroup -Headers $headers -DisplayName $tgtName `
+                -Description "Flattened membership of '$srcName', managed by Sync-FlattenedGroup.ps1"
+            $targetGroupIsNew = $true
+        } else {
+            Write-Log "[WhatIf] Would create group '$tgtName'" "WARN"
+            continue
         }
-        if ($toRemove.Count -gt 0) {
-            Write-Log "Removing $($toRemove.Count) member(s) from '$TargetGroup'..."
-            Remove-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $toRemove
-        }
-        Write-Log "Membership sync complete." "SUCCESS"
     } else {
-        Write-Log "[WhatIf] Would add $($toAdd.Count) member(s) and remove $($toRemove.Count) member(s)." "WARN"
+        Write-Log "Target group resolved: '$($targetGroupObj.displayName)' (ID: $($targetGroupObj.id))" "SUCCESS"
+    }
+
+    # ── Get flattened source members ──────────────────────────────────────────
+
+    Write-Log "Fetching transitive (flattened) members of source group '$srcName'..."
+    $flatMembers   = @(Get-GroupTransitiveMembers -Headers $headers -GroupId $sourceGroupObj.id)
+    $uniqueMembers = @($flatMembers | Sort-Object id -Unique)
+    Write-Log "Found $($uniqueMembers.Count) unique user(s) in flattened source group." "SUCCESS"
+
+    if ($VerbosePreference -ne 'SilentlyContinue') {
+        $uniqueMembers | ForEach-Object { Write-Verbose "  - $($_.userPrincipalName) ($($_.id))" }
+    }
+
+    # ── Get current target group members ─────────────────────────────────────
+
+    if ($targetGroupIsNew) {
+        Write-Log "Target group '$tgtName' was just created -- skipping member fetch (empty by definition)."
+        $currentUserIds = @()
+    } else {
+        Write-Log "Fetching current members of target group '$tgtName'..."
+        $currentMembers = @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
+        $currentUserIds = @($currentMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })
+        Write-Log "Target group currently has $($currentUserIds.Count) user member(s)."
+    }
+
+    # ── Compute diff ──────────────────────────────────────────────────────────
+
+    $desiredIds = @($uniqueMembers | ForEach-Object { $_.id })
+
+    $desiredSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in $desiredIds)     { $null = $desiredSet.Add($id) }
+    $actualSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in $currentUserIds) { $null = $actualSet.Add($id) }
+
+    $toAdd    = @($desiredSet | Where-Object { -not $actualSet.Contains($_) })
+    $toRemove = @($actualSet  | Where-Object { -not $desiredSet.Contains($_) })
+
+    Write-Log "Diff -- To add: $($toAdd.Count)  |  To remove: $($toRemove.Count)  |  Unchanged: $($actualSet.Count - $toRemove.Count)"
+
+    # ── Apply changes ─────────────────────────────────────────────────────────
+
+    if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
+        Write-Log "Target group '$tgtName' is already up to date -- no changes required." "SUCCESS"
+    } else {
+        if ($PSCmdlet.ShouldProcess($tgtName, "Sync group membership (add $($toAdd.Count), remove $($toRemove.Count))")) {
+            if ($toAdd.Count -gt 0) {
+                Write-Log "Adding $($toAdd.Count) member(s) to '$tgtName'..."
+                Add-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $toAdd
+            }
+            if ($toRemove.Count -gt 0) {
+                Write-Log "Removing $($toRemove.Count) member(s) from '$tgtName'..."
+                Remove-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $toRemove
+            }
+            Write-Log "Membership sync complete for '$tgtName'." "SUCCESS"
+        } else {
+            Write-Log "[WhatIf] Would add $($toAdd.Count) member(s) and remove $($toRemove.Count) member(s)." "WARN"
+        }
     }
 }
+
+Write-Log "All $($SourceGroup.Count) group pair(s) processed." "SUCCESS"
