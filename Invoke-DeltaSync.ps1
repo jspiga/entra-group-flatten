@@ -78,7 +78,13 @@ param(
     [string]$ConfigPath    = (Join-Path $PSScriptRoot "config.json"),
     [string]$StateFilePath = "",
 
-    [switch]$ForceFullSync
+    [switch]$ForceFullSync,
+
+    # Where to sync the flattened membership. Defaults to "Entra" if not specified.
+    # Use "Atlassian" alone if Entra SCIM provisioning is already active (avoids race conditions).
+    # Use "Entra","Atlassian" to sync to both. Can also be set via "syncTo" in config.json.
+    [ValidateSet("Entra", "Atlassian")]
+    [string[]]$SyncTo = @()
 )
 
 Set-StrictMode -Version Latest
@@ -102,6 +108,7 @@ function Write-Log {
 . (Join-Path $PSScriptRoot "lib/GraphAuth.ps1")
 . (Join-Path $PSScriptRoot "lib/GraphGroups.ps1")
 . (Join-Path $PSScriptRoot "lib/StateStore.ps1")
+. (Join-Path $PSScriptRoot "lib/AtlassianScim.ps1")
 
 # ── Load config ───────────────────────────────────────────────────────────────
 
@@ -134,6 +141,31 @@ foreach ($required in @("TenantId","ClientId","ClientSecret")) {
     if (-not (Get-Variable $required -ValueOnly -ErrorAction SilentlyContinue)) {
         throw "Missing required value: '$required'. Provide it as a parameter or in config.json."
     }
+}
+
+# ── Resolve SyncTo destinations ───────────────────────────────────────────────
+
+$effectiveSyncTo = if ($SyncTo.Count -gt 0) {
+    $SyncTo
+} elseif ($config["syncTo"]) {
+    @($config["syncTo"])
+} else {
+    @("Entra")
+}
+
+$syncToEntra     = $effectiveSyncTo -contains "Entra"
+$syncToAtlassian = $effectiveSyncTo -contains "Atlassian"
+
+Write-Log "Sync destinations: $($effectiveSyncTo -join ', ')"
+
+if ($syncToAtlassian) {
+    $atlassianDirectoryId = $config["atlassianDirectoryId"]
+    $atlassianApiKey      = $config["atlassianScimApiKey"]
+    if (-not $atlassianDirectoryId -or -not $atlassianApiKey) {
+        throw "atlassianDirectoryId and atlassianScimApiKey must be set in config.json when syncing to Atlassian."
+    }
+    Write-Log "Atlassian SCIM enabled (directory: $atlassianDirectoryId)"
+    Initialize-ScimClient -DirectoryId $atlassianDirectoryId -ApiKey $atlassianApiKey
 }
 
 # ── Validate inputs ───────────────────────────────────────────────────────────
@@ -320,20 +352,47 @@ for ($i = 0; $i -lt $SourceGroup.Count; $i++) {
 
         Write-Log "Live diff -- Add: $($liveToAdd.Count)  |  Remove: $($liveToRemove.Count)"
 
-        if ($liveToAdd.Count -gt 0) {
-            Write-Log "Adding $($liveToAdd.Count) member(s) to '$tgtName'..."
-            Add-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $liveToAdd
+        if ($syncToEntra) {
+            if ($liveToAdd.Count -gt 0) {
+                Write-Log "[Entra] Adding $($liveToAdd.Count) member(s) to '$tgtName'..."
+                Add-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $liveToAdd
+            }
+            if ($liveToRemove.Count -gt 0) {
+                Write-Log "[Entra] Removing $($liveToRemove.Count) member(s) from '$tgtName'..."
+                Remove-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $liveToRemove
+            }
+            Write-Log "[Entra] Target group '$tgtName' sync complete." "SUCCESS"
+        } else {
+            Write-Log "[Entra] Skipping Entra ID write (not in SyncTo destinations)." "INFO"
         }
-        if ($liveToRemove.Count -gt 0) {
-            Write-Log "Removing $($liveToRemove.Count) member(s) from '$tgtName'..."
-            Remove-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $liveToRemove
-        }
-
-        Write-Log "Target group '$tgtName' sync complete." "SUCCESS"
 
         # Update tracked target membership in state (namespaced)
         if (-not $state.trackedMembers) { $state.trackedMembers = @{} }
         $state.trackedMembers[$targetMembersKey] = @($desiredSet)
+    }
+
+    # ── Apply changes to Atlassian Cloud (SCIM) ───────────────────────────────
+
+    if ($syncToAtlassian) {
+        Write-Log "[Atlassian] Syncing '$tgtName' to Atlassian Cloud via SCIM..."
+        # Build user objects from tracked members (need userPrincipalName for SCIM lookup)
+        # Fetch UPNs for all desired user IDs from the tracked member snapshots
+        $desiredUserObjects = @()
+        foreach ($groupId in $groupIds) {
+            $members = Get-TrackedMembers -State $state -GroupId "$stateKey|$groupId"
+            foreach ($m in $members) {
+                if ($m -isnot [string] -and $m.id -and $m.userPrincipalName) {
+                    $desiredUserObjects += $m
+                }
+            }
+        }
+        # De-duplicate by id
+        $desiredUserObjects = @($desiredUserObjects | Sort-Object { $_.id } -Unique)
+
+        Sync-ScimGroupMembership `
+            -GroupDisplayName  $tgtName `
+            -DesiredEntraUsers $desiredUserObjects `
+            -WhatIf            $false
     }
 }
 

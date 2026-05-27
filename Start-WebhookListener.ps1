@@ -153,7 +153,8 @@ function Start-SyncJob {
         [string]$SourceGroupName,
         [string]$TargetGroupName,
         [string]$AbsConfigPath,
-        [string]$AbsDeltaSyncScript
+        [string]$AbsDeltaSyncScript,
+        [string[]]$SyncToDestinations = @("Entra")
     )
 
     # If a job is already running for this group, skip
@@ -165,11 +166,11 @@ function Start-SyncJob {
         }
     }
 
-    Write-Log "Starting sync job: '$SourceGroupName' -> '$TargetGroupName'"
+    Write-Log "Starting sync job: '$SourceGroupName' -> '$TargetGroupName' (SyncTo: $($SyncToDestinations -join ','))"
     $job = Start-Job -ScriptBlock {
-        param($script, $src, $tgt, $cfg)
-        & $script -SourceGroup $src -TargetGroup $tgt -ConfigPath $cfg 2>&1
-    } -ArgumentList $AbsDeltaSyncScript, $SourceGroupName, $TargetGroupName, $AbsConfigPath
+        param($script, $src, $tgt, $cfg, $syncTo)
+        & $script -SourceGroup $src -TargetGroup $tgt -ConfigPath $cfg -SyncTo $syncTo 2>&1
+    } -ArgumentList $AbsDeltaSyncScript, $SourceGroupName, $TargetGroupName, $AbsConfigPath, $SyncToDestinations
 
     $activeJobs[$SourceGroupName] = $job
 }
@@ -192,6 +193,17 @@ $subStore = Load-SubscriptionStore
 $registry = Load-Registry
 Write-Log "Subscription store loaded (clientState: $($subStore['clientState']))."
 Write-Log "Group registry loaded: $($registry.Count) group(s) monitored."
+
+# Read SyncTo destinations from config
+$configSyncTo = @("Entra")   # default
+if (Test-Path $ConfigPath) {
+    $cfgRaw   = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+    $syncToProp = $cfgRaw.PSObject.Properties['syncTo']
+    if ($syncToProp -and $syncToProp.Value) {
+        $configSyncTo = @($syncToProp.Value)
+    }
+}
+Write-Log "Sync destinations (from config): $($configSyncTo -join ', ')"
 
 if ($registry.Count -eq 0) {
     Write-Log "WARNING: Group registry is empty. Run Register-ChangeNotification.ps1 first." "WARN"
@@ -244,7 +256,8 @@ try {
                     Start-SyncJob -SourceGroupName $srcName `
                                   -TargetGroupName $regEntry["targetGroup"] `
                                   -AbsConfigPath $absConfigPath `
-                                  -AbsDeltaSyncScript $absDeltaSyncScript
+                                  -AbsDeltaSyncScript $absDeltaSyncScript `
+                                  -SyncToDestinations $configSyncTo
                 }
             }
         }

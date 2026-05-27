@@ -6,5 +6,12 @@
   "webhookNotificationUrl": "https://your-endpoint.example.com/notify",
   "stateFilePath": "./state/group-state.json",
   "groupRegistryPath": "./state/group-registry.json",
-  "subscriptionStorePath": "./state/subscriptions.json"
+  "subscriptionStorePath": "./state/subscriptions.json",
+
+  "_comment_syncTo": "Where to sync: 'Entra', 'Atlassian', or both. Defaults to ['Entra'] if omitted. Can be overridden per-run with -SyncTo parameter.",
+  "syncTo": ["Entra"],
+
+  "_comment_atlassian": "Required when 'Atlassian' is included in syncTo",
+  "atlassianDirectoryId": "your-scim-directory-id",
+  "atlassianScimApiKey": "your-scim-api-key"
 }

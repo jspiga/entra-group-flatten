@@ -12,6 +12,7 @@ Flattens a nested Entra ID (Azure AD) security group and keeps a target group sy
 - [Option 1 — Manual / Scheduled Sync](#option-1--manual--scheduled-sync)
 - [Option 2 — Delta Query Optimised Sync](#option-2--delta-query-optimised-sync)
 - [Option 3 — Webhook-Driven Sync](#option-3--webhook-driven-sync)
+- [Atlassian Cloud Sync (-SyncTo)](#atlassian-cloud-sync--syncto)
 - [Target Group Naming & Prefix](#target-group-naming--prefix)
 - [File Reference](#file-reference)
 - [Required API Permissions](#required-api-permissions)
@@ -48,10 +49,13 @@ Copy `config.example.json` to `config.json` and fill in your values:
   "clientId": "your-app-registration-client-id",
   "clientSecret": "your-client-secret",
   "targetGroupPrefix": "FLAT_",
+  "syncTo": ["Entra"],
   "webhookNotificationUrl": "https://your-endpoint.example.com/notify",
   "stateFilePath": "./state/group-state.json",
   "groupRegistryPath": "./state/group-registry.json",
-  "subscriptionStorePath": "./state/subscriptions.json"
+  "subscriptionStorePath": "./state/subscriptions.json",
+  "atlassianDirectoryId": "your-scim-directory-id",
+  "atlassianScimApiKey": "your-scim-api-key"
 }
 ```
 
@@ -61,10 +65,13 @@ Copy `config.example.json` to `config.json` and fill in your values:
 | `clientId` | Yes | App Registration client ID |
 | `clientSecret` | Yes | Client secret value |
 | `targetGroupPrefix` | No | If set, automatically prepended to target group names that don't already have it (e.g. `FLAT_`) |
+| `syncTo` | No | Where to sync flattened membership. Array of `"Entra"`, `"Atlassian"`, or both. Defaults to `["Entra"]` if omitted. Overridden per-run by `-SyncTo` parameter. |
 | `webhookNotificationUrl` | Option 3 only | Public HTTPS URL that Graph will POST change notifications to |
 | `stateFilePath` | Option 2 only | Path to the JSON state file for delta link persistence (relative to script root or absolute) |
 | `groupRegistryPath` | Option 3 only | Path to the group registry JSON (maps group IDs to source groups). Default: `./state/group-registry.json` |
 | `subscriptionStorePath` | Option 3 only | Path to the subscription store JSON. Default: `./state/subscriptions.json` |
+| `atlassianDirectoryId` | Atlassian only | SCIM directory ID from Atlassian admin (found in Directory base URL) |
+| `atlassianScimApiKey` | Atlassian only | SCIM API key from Atlassian admin (separate from the Cloud admin API key) |
 
 > **Security note:** `config.json` contains sensitive credentials. Do not commit it to source control. Add it to `.gitignore`. Consider using environment variables or a secrets manager in production.
 
@@ -80,17 +87,17 @@ Calls `GET /groups/{id}/transitiveMembers` to obtain a fully flattened list of u
 
 ```powershell
 # Minimal — reads credentials from config.json
-.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_All-Engineering"
+.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat"
 
 # Override credentials inline
-.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_All-Engineering" `
+.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat" `
     -TenantId "<tid>" -ClientId "<cid>" -ClientSecret "<secret>"
 
 # Dry run — shows what would change without making any API write calls
-.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_All-Engineering" -WhatIf
+.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat" -WhatIf
 
 # Verbose output (shows individual member names)
-.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_All-Engineering" -Verbose
+.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat" -Verbose
 ```
 
 ### Scheduling
@@ -99,7 +106,7 @@ To run on a schedule with Windows Task Scheduler:
 
 ```powershell
 $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument '-NonInteractive -ExecutionPolicy ByPass -File "C:\scripts\entra-group-flatten\Sync-FlattenedGroup.ps1" -SourceGroup "All-Engineering" -TargetGroup "FLAT_All-Engineering"'
+    -Argument '-NonInteractive -ExecutionPolicy ByPass -File "C:\scripts\entra-group-flatten\Sync-FlattenedGroup.ps1" -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat"'
 $trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Hours 1) -Once -At (Get-Date)
 Register-ScheduledTask -TaskName "EntraGroupFlatten" -Action $action -Trigger $trigger -RunLevel Highest
 ```
@@ -123,13 +130,13 @@ Builds on Option 1 by using [Microsoft Graph delta queries](https://learn.micros
 
 ```powershell
 # Normal run (uses delta links if available, full sync on first run)
-.\Invoke-DeltaSync.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_All-Engineering"
+.\Invoke-DeltaSync.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat"
 
 # Force a full re-sync (discards all stored delta state)
-.\Invoke-DeltaSync.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_All-Engineering" -ForceFullSync
+.\Invoke-DeltaSync.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat" -ForceFullSync
 
 # Custom state file location
-.\Invoke-DeltaSync.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_All-Engineering" `
+.\Invoke-DeltaSync.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat" `
     -StateFilePath "C:\data\entra-state.json"
 ```
 
@@ -164,13 +171,13 @@ Run once per source group (or all at once). Pass multiple groups as an array:
 # Single group
 .\Register-ChangeNotification.ps1 `
     -SourceGroup "All-Engineering" `
-    -TargetGroup "FLAT_All-Engineering" `
+    -TargetGroup "EngineeringFlat" `
     -NotificationUrl "https://your-endpoint.example.com/notify"
 
 # Multiple groups (scales to 100+ with a single subscription)
 .\Register-ChangeNotification.ps1 `
     -SourceGroup "All-Engineering","All-Finance","All-HR" `
-    -TargetGroup "FLAT_All-Engineering","FLAT_All-Finance","FLAT_All-HR" `
+    -TargetGroup "EngineeringFlat","FinanceFlat","HRFlat" `
     -NotificationUrl "https://your-endpoint.example.com/notify"
 ```
 
@@ -182,7 +189,7 @@ Graph subscriptions on `/groups` expire after a maximum of 3 days. Schedule this
 
 ```powershell
 $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument '-NonInteractive -ExecutionPolicy ByPass -File "C:\scripts\entra-group-flatten\Register-ChangeNotification.ps1" -SourceGroup "All-Engineering","All-Finance" -TargetGroup "FLAT_All-Engineering","FLAT_All-Finance"'
+    -Argument '-NonInteractive -ExecutionPolicy ByPass -File "C:\scripts\entra-group-flatten\Register-ChangeNotification.ps1" -SourceGroup "All-Engineering","All-Finance" -TargetGroup "EngineeringFlat","FinanceFlat"'
 $trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Days 2) -Once -At (Get-Date)
 Register-ScheduledTask -TaskName "EntraGroupFlattenRenew" -Action $action -Trigger $trigger -RunLevel Highest
 ```
@@ -210,18 +217,85 @@ The listener automatically reads `state/group-registry.json` to route notificati
 
 ---
 
+## Atlassian Cloud Sync (-SyncTo)
+
+All three options support a `-SyncTo` parameter controlling where the flattened membership is written. This allows you to provision groups directly into **Atlassian Cloud** via the [User Provisioning REST API (SCIM 2.0)](https://developer.atlassian.com/cloud/admin/user-provisioning/rest/intro/), avoiding or supplementing Entra ID group sync.
+
+### SyncTo values
+
+| Value | Behaviour |
+|---|---|
+| `Entra` (default) | Syncs to the Entra ID target group only. Safe to use alongside native Entra SCIM provisioning to Atlassian. |
+| `Atlassian` | Syncs directly to Atlassian Cloud via SCIM only. **Use this when Entra ID SCIM provisioning is already active** -- avoids race conditions and confused deputy scenarios where both systems modify the same Atlassian group. |
+| `Entra,Atlassian` | Syncs to both Entra ID and Atlassian Cloud. Only use this if you are **not** using Entra native SCIM provisioning to Atlassian. |
+
+> **Important:** If you use Entra ID's built-in SCIM provisioning to push groups to Atlassian, use `-SyncTo Atlassian` (or `"syncTo": ["Atlassian"]` in config.json) to avoid race conditions where both the flattening scripts and Entra SCIM try to manage the same Atlassian group simultaneously.
+
+### How it works
+
+1. Each Entra user's `userPrincipalName` (UPN) is used to look up their Atlassian account via `GET /Users?filter=userName eq "upn@domain.com"`
+2. The resolved Atlassian user IDs are diffed against the current SCIM group membership
+3. Members are added/removed via `PATCH /Groups/{id}` with SCIM PatchOp operations, batched in groups of 50
+
+### Setup
+
+1. In [Atlassian Admin](https://admin.atlassian.com), go to **Directory → User provisioning**
+2. Create a new API key and note the **Directory base URL** (contains your `directoryId`)
+3. Add to `config.json`:
+   ```json
+   "atlassianDirectoryId": "your-directory-id-from-base-url",
+   "atlassianScimApiKey":  "your-scim-api-key",
+   "syncTo": ["Atlassian"]
+   ```
+4. Keep these values safe -- Atlassian will not show the API key again
+
+### Usage
+
+```powershell
+# Option 1 -- Atlassian only (recommended when Entra SCIM provisioning is active)
+.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "EngineeringFlat" -SyncTo Atlassian
+
+# Option 1 -- Entra ID only (default, no flag needed)
+.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "EngineeringFlat"
+
+# Option 1 -- Both destinations
+.\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "EngineeringFlat" -SyncTo Entra,Atlassian
+
+# Option 2 -- delta sync to Atlassian
+.\Invoke-DeltaSync.ps1 -SourceGroup "All-Engineering" -TargetGroup "EngineeringFlat" -SyncTo Atlassian
+
+# Multiple groups
+.\Sync-FlattenedGroup.ps1 `
+    -SourceGroup "All-Engineering","All-Finance" `
+    -TargetGroup "EngineeringFlat","FinanceFlat" `
+    -SyncTo Atlassian
+
+# Always-on via config (no flag needed on each invocation)
+# Set "syncTo": ["Atlassian"] in config.json
+```
+
+### Important notes
+
+- **Users must exist in Atlassian** -- this script does not create Atlassian accounts. Users must already exist in the directory (e.g. via Just-in-Time provisioning or manual invite) with a matching `userName` (typically their UPN/email).
+- **Race condition avoidance** -- if Entra ID SCIM provisioning is active, use `-SyncTo Atlassian` only. Using `Entra,Atlassian` alongside native SCIM provisioning can cause flapping where both systems race to manage the same group.
+- **SCIM group naming** -- the same target group name (with prefix) is used for both the Entra ID group and the Atlassian SCIM group.
+- **Domain verification** -- users can only be managed if their email domain is verified in Atlassian Admin.
+- **SCIM API key security** -- the SCIM API key gives full directory admin access. Treat it like a password.
+
+---
+
 ## Target Group Naming & Prefix
 
 If `targetGroupPrefix` is set in `config.json` (e.g. `"FLAT_"`), the scripts will automatically prepend it to any `-TargetGroup` value that doesn't already start with the prefix:
 
 ```
--TargetGroup "All-Engineering"        ->  resolved to "FLAT_All-Engineering"
--TargetGroup "FLAT_All-Engineering"   ->  unchanged (prefix already present)
+-TargetGroup "EngineeringFlat"        ->  resolved to "FLAT_EngineeringFlat"
+-TargetGroup "FLAT_EngineeringFlat"   ->  unchanged (prefix already present)
 ```
 
 A message is printed to confirm the normalisation:
 ```
-[INFO] Target group name normalised to: 'FLAT_All-Engineering' (prefix 'FLAT_' applied)
+[INFO] Target group name normalised to: 'FLAT_EngineeringFlat' (prefix 'FLAT_' applied)
 ```
 
 If no prefix is configured, the supplied name is used as-is.
@@ -243,7 +317,8 @@ entra-group-flatten/
 ├── lib/
 │   ├── GraphAuth.ps1                # Shared: OAuth2 client credentials token acquisition + caching
 │   ├── GraphGroups.ps1              # Shared: All Graph group operations (get, create, add, remove, delta)
-│   └── StateStore.ps1               # Option 2/3: JSON state persistence for delta links + member snapshots
+│   ├── StateStore.ps1               # Option 2/3: JSON state persistence for delta links + member snapshots
+│   └── AtlassianScim.ps1            # Optional: Atlassian SCIM 2.0 group provisioning (-SyncTo Atlassian)
 │
 └── state/                           # Auto-created at runtime
     ├── group-state.json             # Option 2: Delta link + member snapshot store
@@ -273,7 +348,8 @@ For Option 3 (webhooks), no additional API permissions are needed -- the subscri
 ## Notes & Caveats
 
 - **Rate limiting:** All Graph API calls use automatic exponential backoff on HTTP 429 responses. For very large groups (10,000+ members), consider using Option 2 to minimise API call volume.
-- **SCIM sync delay:** Even after the target group is updated in Entra ID, downstream SCIM provisioning to applications (e.g. Atlassian Cloud) may take 20--40 minutes to propagate.
+- **SCIM sync delay:** Even after the target group is updated in Entra ID, downstream SCIM provisioning to applications may take 20--40 minutes to propagate. Using `-SyncTo Atlassian` bypasses this delay by provisioning directly.
+- **Atlassian SCIM batch limit:** The Atlassian SCIM API suspends sync if a single batch exceeds 10,000 users. This script batches in groups of 50 to stay well within the limit.
 - **Webhook HTTPS requirement:** Microsoft Graph will only deliver notifications to HTTPS endpoints with a valid TLS certificate. For production, place the listener behind a reverse proxy or deploy as an Azure Function.
 - **Subscription expiry:** Graph change notification subscriptions for group resources expire after at most 3 days. Run `Register-ChangeNotification.ps1` on a schedule (every 2 days) to keep them active.
 - **Target group type:** New target groups are created as mail-disabled security groups (`securityEnabled: true`, `mailEnabled: false`). This is the correct type for Atlassian Cloud SCIM group provisioning.

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Version 1 (MVP): Flattens a source Entra ID group and synchronises the result to a target group.
+    Option 1: Flattens a source Entra ID group and synchronises the result to a target group.
 
 .DESCRIPTION
     Uses the Microsoft Graph API transitive members endpoint to obtain a fully flattened list of
@@ -12,11 +12,10 @@
     Authentication uses the OAuth2 client credentials flow (App Registration).
 
 .PARAMETER SourceGroup
-    Display name of the source group to flatten.
+    One or more source group display names to flatten. Accepts an array.
 
 .PARAMETER TargetGroup
-    Display name of the target group to create/update. If a targetGroupPrefix is configured and
-    the name does not already start with that prefix, the prefix is applied automatically.
+    One or more corresponding target group display names (must match SourceGroup order).
 
 .PARAMETER TenantId
     Azure AD tenant ID. Overrides config.json if provided.
@@ -30,17 +29,31 @@
 .PARAMETER ConfigPath
     Path to config.json. Defaults to ./config.json relative to the script location.
 
+.PARAMETER SyncTo
+    Where to sync the flattened membership. Accepts one or both of: "Entra", "Atlassian".
+    Defaults to "Entra" if not specified.
+    Use "Atlassian" alone if Entra ID SCIM provisioning is already handling Entra group sync
+    (to avoid race conditions). Use "Entra","Atlassian" to sync to both simultaneously.
+    Can also be set persistently via the "syncTo" array in config.json.
+
 .PARAMETER WhatIf
     Dry-run mode: shows what would be added/removed without making any changes.
 
 .EXAMPLE
-    # Using config.json for credentials, with a target group name that gets auto-prefixed
+    # Default -- syncs to Entra ID only
     .\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "EngineeringFlat"
 
 .EXAMPLE
-    # Fully explicit, override all config values
-    .\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "FLAT_EngineeringFlat" `
-        -TenantId "..." -ClientId "..." -ClientSecret "..."
+    # Sync to Atlassian Cloud only (use when Entra SCIM provisioning is active)
+    .\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "EngineeringFlat" -SyncTo Atlassian
+
+.EXAMPLE
+    # Sync to both Entra ID and Atlassian Cloud
+    .\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering" -TargetGroup "EngineeringFlat" -SyncTo Entra,Atlassian
+
+.EXAMPLE
+    # Multiple groups, Atlassian only
+    .\Sync-FlattenedGroup.ps1 -SourceGroup "All-Engineering","All-Finance" -TargetGroup "EngineeringFlat","FinanceFlat" -SyncTo Atlassian
 
 .EXAMPLE
     # Dry run to preview changes without applying them
@@ -59,7 +72,13 @@ param(
     [string]$ClientId,
     [string]$ClientSecret,
 
-    [string]$ConfigPath = (Join-Path $PSScriptRoot "config.json")
+    [string]$ConfigPath = (Join-Path $PSScriptRoot "config.json"),
+
+    # Where to sync the flattened membership. Defaults to "Entra" if not specified.
+    # Use "Atlassian" alone if Entra SCIM provisioning is already active (avoids race conditions).
+    # Use "Entra","Atlassian" to sync to both. Can also be set via "syncTo" in config.json.
+    [ValidateSet("Entra", "Atlassian")]
+    [string[]]$SyncTo = @()
 )
 
 Set-StrictMode -Version Latest
@@ -84,6 +103,7 @@ function Write-Log {
 
 . (Join-Path $PSScriptRoot "lib/GraphAuth.ps1")
 . (Join-Path $PSScriptRoot "lib/GraphGroups.ps1")
+. (Join-Path $PSScriptRoot "lib/AtlassianScim.ps1")
 
 # ── Load config ───────────────────────────────────────────────────────────────
 
@@ -105,6 +125,32 @@ foreach ($required in @("TenantId","ClientId","ClientSecret")) {
     if (-not (Get-Variable $required -ValueOnly -ErrorAction SilentlyContinue)) {
         throw "Missing required value: '$required'. Provide it as a parameter or in config.json."
     }
+}
+
+# ── Resolve SyncTo destinations ───────────────────────────────────────────────
+
+# -SyncTo parameter overrides config; if neither provided, default to Entra
+$effectiveSyncTo = if ($SyncTo.Count -gt 0) {
+    $SyncTo
+} elseif ($config["syncTo"]) {
+    @($config["syncTo"])
+} else {
+    @("Entra")
+}
+
+$syncToEntra      = $effectiveSyncTo -contains "Entra"
+$syncToAtlassian  = $effectiveSyncTo -contains "Atlassian"
+
+Write-Log "Sync destinations: $($effectiveSyncTo -join ', ')"
+
+if ($syncToAtlassian) {
+    $atlassianDirectoryId = $config["atlassianDirectoryId"]
+    $atlassianApiKey      = $config["atlassianScimApiKey"]
+    if (-not $atlassianDirectoryId -or -not $atlassianApiKey) {
+        throw "atlassianDirectoryId and atlassianScimApiKey must be set in config.json when syncing to Atlassian."
+    }
+    Write-Log "Atlassian SCIM enabled (directory: $atlassianDirectoryId)"
+    Initialize-ScimClient -DirectoryId $atlassianDirectoryId -ApiKey $atlassianApiKey
 }
 
 # ── Validate inputs ───────────────────────────────────────────────────────────
@@ -137,26 +183,6 @@ for ($i = 0; $i -lt $SourceGroup.Count; $i++) {
     }
     Write-Log "Source group resolved: '$($sourceGroupObj.displayName)' (ID: $($sourceGroupObj.id))" "SUCCESS"
 
-    # ── Resolve or create target group ────────────────────────────────────────
-
-    Write-Log "Resolving target group: '$tgtName'"
-    $targetGroupObj  = Get-GroupByName -Headers $headers -DisplayName $tgtName
-    $targetGroupIsNew = $false
-
-    if (-not $targetGroupObj) {
-        Write-Log "Target group '$tgtName' not found." "WARN"
-        if ($PSCmdlet.ShouldProcess($tgtName, "Create new Entra ID security group")) {
-            $targetGroupObj   = New-EntraGroup -Headers $headers -DisplayName $tgtName `
-                -Description "Flattened membership of '$srcName', managed by Sync-FlattenedGroup.ps1"
-            $targetGroupIsNew = $true
-        } else {
-            Write-Log "[WhatIf] Would create group '$tgtName'" "WARN"
-            continue
-        }
-    } else {
-        Write-Log "Target group resolved: '$($targetGroupObj.displayName)' (ID: $($targetGroupObj.id))" "SUCCESS"
-    }
-
     # ── Get flattened source members ──────────────────────────────────────────
 
     Write-Log "Fetching transitive (flattened) members of source group '$srcName'..."
@@ -168,50 +194,78 @@ for ($i = 0; $i -lt $SourceGroup.Count; $i++) {
         $uniqueMembers | ForEach-Object { Write-Verbose "  - $($_.userPrincipalName) ($($_.id))" }
     }
 
-    # ── Get current target group members ─────────────────────────────────────
+    # ── Apply changes to Entra ID ─────────────────────────────────────────────
 
-    if ($targetGroupIsNew) {
-        Write-Log "Target group '$tgtName' was just created -- skipping member fetch (empty by definition)."
-        $currentUserIds = @()
-    } else {
-        Write-Log "Fetching current members of target group '$tgtName'..."
-        $currentMembers = @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
-        $currentUserIds = @($currentMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })
-        Write-Log "Target group currently has $($currentUserIds.Count) user member(s)."
+    if ($syncToEntra) {
+        # Resolve or create target group in Entra ID
+        Write-Log "Resolving target group: '$tgtName'"
+        $targetGroupObj  = Get-GroupByName -Headers $headers -DisplayName $tgtName
+        $targetGroupIsNew = $false
+
+        if (-not $targetGroupObj) {
+            Write-Log "Target group '$tgtName' not found." "WARN"
+            if ($PSCmdlet.ShouldProcess($tgtName, "Create new Entra ID security group")) {
+                $targetGroupObj   = New-EntraGroup -Headers $headers -DisplayName $tgtName `
+                    -Description "Flattened membership of '$srcName', managed by Sync-FlattenedGroup.ps1"
+                $targetGroupIsNew = $true
+            } else {
+                Write-Log "[WhatIf] Would create group '$tgtName'" "WARN"
+            }
+        } else {
+            Write-Log "Target group resolved: '$($targetGroupObj.displayName)' (ID: $($targetGroupObj.id))" "SUCCESS"
+        }
+
+        if ($targetGroupObj) {
+            if ($targetGroupIsNew) {
+                Write-Log "Target group '$tgtName' was just created -- skipping member fetch (empty by definition)."
+                $currentUserIds = @()
+            } else {
+                Write-Log "Fetching current members of target group '$tgtName'..."
+                $currentMembers = @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
+                $currentUserIds = @($currentMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } | ForEach-Object { $_.id })
+                Write-Log "Target group currently has $($currentUserIds.Count) user member(s)."
+            }
+
+            $desiredIds = @($uniqueMembers | ForEach-Object { $_.id })
+            $desiredSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($id in $desiredIds)     { $null = $desiredSet.Add($id) }
+            $actualSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($id in $currentUserIds) { $null = $actualSet.Add($id) }
+
+            $toAdd    = @($desiredSet | Where-Object { -not $actualSet.Contains($_) })
+            $toRemove = @($actualSet  | Where-Object { -not $desiredSet.Contains($_) })
+
+            Write-Log "[Entra] Diff -- To add: $($toAdd.Count)  |  To remove: $($toRemove.Count)  |  Unchanged: $($actualSet.Count - $toRemove.Count)"
+
+            if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
+                Write-Log "[Entra] Target group '$tgtName' is already up to date." "SUCCESS"
+            } else {
+                if ($PSCmdlet.ShouldProcess($tgtName, "Sync Entra group membership (add $($toAdd.Count), remove $($toRemove.Count))")) {
+                    if ($toAdd.Count -gt 0) {
+                        Write-Log "[Entra] Adding $($toAdd.Count) member(s) to '$tgtName'..."
+                        Add-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $toAdd
+                    }
+                    if ($toRemove.Count -gt 0) {
+                        Write-Log "[Entra] Removing $($toRemove.Count) member(s) from '$tgtName'..."
+                        Remove-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $toRemove
+                    }
+                    Write-Log "[Entra] Membership sync complete for '$tgtName'." "SUCCESS"
+                } else {
+                    Write-Log "[Entra] [WhatIf] Would add $($toAdd.Count) member(s) and remove $($toRemove.Count) member(s)." "WARN"
+                }
+            }
+        }
     }
 
-    # ── Compute diff ──────────────────────────────────────────────────────────
+    # ── Apply changes to Atlassian Cloud (SCIM) ───────────────────────────────
 
-    $desiredIds = @($uniqueMembers | ForEach-Object { $_.id })
-
-    $desiredSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($id in $desiredIds)     { $null = $desiredSet.Add($id) }
-    $actualSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($id in $currentUserIds) { $null = $actualSet.Add($id) }
-
-    $toAdd    = @($desiredSet | Where-Object { -not $actualSet.Contains($_) })
-    $toRemove = @($actualSet  | Where-Object { -not $desiredSet.Contains($_) })
-
-    Write-Log "Diff -- To add: $($toAdd.Count)  |  To remove: $($toRemove.Count)  |  Unchanged: $($actualSet.Count - $toRemove.Count)"
-
-    # ── Apply changes ─────────────────────────────────────────────────────────
-
-    if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
-        Write-Log "Target group '$tgtName' is already up to date -- no changes required." "SUCCESS"
-    } else {
-        if ($PSCmdlet.ShouldProcess($tgtName, "Sync group membership (add $($toAdd.Count), remove $($toRemove.Count))")) {
-            if ($toAdd.Count -gt 0) {
-                Write-Log "Adding $($toAdd.Count) member(s) to '$tgtName'..."
-                Add-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $toAdd
-            }
-            if ($toRemove.Count -gt 0) {
-                Write-Log "Removing $($toRemove.Count) member(s) from '$tgtName'..."
-                Remove-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $toRemove
-            }
-            Write-Log "Membership sync complete for '$tgtName'." "SUCCESS"
-        } else {
-            Write-Log "[WhatIf] Would add $($toAdd.Count) member(s) and remove $($toRemove.Count) member(s)." "WARN"
-        }
+    if ($syncToAtlassian) {
+        Write-Log "[Atlassian] Syncing '$tgtName' to Atlassian Cloud via SCIM..."
+        $whatIfBool = -not $PSCmdlet.ShouldProcess($tgtName, "Sync Atlassian SCIM group")
+        Sync-ScimGroupMembership `
+            -GroupDisplayName  $tgtName `
+            -DesiredEntraUsers $uniqueMembers `
+            -WhatIf            $whatIfBool
     }
 }
 
