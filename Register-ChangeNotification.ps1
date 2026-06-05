@@ -82,13 +82,20 @@ param(
     [string]$ClientSecret,
     [string]$NotificationUrl,
 
-    [string]$ConfigPath           = (Join-Path $PSScriptRoot "config.json"),
-    [string]$SubscriptionStorePath = (Join-Path $PSScriptRoot "state/subscriptions.json"),
-    [string]$RegistryPath         = (Join-Path $PSScriptRoot "state/group-registry.json")
+    [string]$ConfigPath            = "",
+    [string]$SubscriptionStorePath = "",
+    [string]$RegistryPath          = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if (-not $PSScriptRoot) {
+    $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if (-not $ConfigPath)            { $ConfigPath            = Join-Path $PSScriptRoot "config.json"               }
+if (-not $SubscriptionStorePath) { $SubscriptionStorePath = Join-Path $PSScriptRoot "state/subscriptions.json"  }
+if (-not $RegistryPath)          { $RegistryPath          = Join-Path $PSScriptRoot "state/group-registry.json" }
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -150,16 +157,26 @@ if ($stateDir -and -not (Test-Path $stateDir)) {
 
 # ── Load existing registry (preserve any existing entries) ───────────────────
 
-$registry = @{}   # groupId -> @{ sourceGroup = "..."; targetGroup = "..." }
+$registry = @{}   # groupId -> @[{ sourceGroup = "..."; targetGroup = "..." }]
+$excludedIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 if (Test-Path $RegistryPath) {
     Write-Log "Loading existing group registry from '$RegistryPath'"
     $raw = Get-Content $RegistryPath -Raw | ConvertFrom-Json
     $raw.PSObject.Properties | ForEach-Object {
-        $entry = @{}
-        $_.Value.PSObject.Properties | ForEach-Object { $entry[$_.Name] = $_.Value }
-        $registry[$_.Name] = $entry
+        if ($_.Name -eq '__excludedTargetGroupIds__') {
+            # Restore excluded target group IDs
+            foreach ($id in @($_.Value)) { $null = $excludedIds.Add($id) }
+        } else {
+            $entries = @()
+            foreach ($item in @($_.Value)) {
+                $e = @{}
+                $item.PSObject.Properties | ForEach-Object { $e[$_.Name] = $_.Value }
+                $entries += $e
+            }
+            $registry[$_.Name] = $entries
+        }
     }
-    Write-Log "Loaded $($registry.Count) existing registry entries."
+    Write-Log "Loaded $($registry.Count) existing registry entries ($($excludedIds.Count) excluded target group IDs)."
 }
 
 # ── Discover and register all group hierarchies ───────────────────────────────
@@ -182,18 +199,43 @@ for ($i = 0; $i -lt $SourceGroup.Count; $i++) {
     Write-Log "Found $($groupIds.Count) group(s) in hierarchy (including root)." "SUCCESS"
 
     foreach ($gId in $groupIds) {
-        $registry[$gId] = @{
-            sourceGroup = $srcName
-            targetGroup = $tgtName
+        # A group ID may belong to multiple source hierarchies (e.g. L2 is both a child of L1
+        # and itself a source group). Store an array of mappings per group ID.
+        $newEntry = @{ sourceGroup = $srcName; targetGroup = $tgtName }
+        if ($registry.ContainsKey($gId)) {
+            $existing = @($registry[$gId])
+            # Only add if this source group isn't already present
+            $alreadyPresent = $existing | Where-Object { $_["sourceGroup"] -eq $srcName }
+            if (-not $alreadyPresent) {
+                $registry[$gId] = $existing + $newEntry
+            }
+        } else {
+            $registry[$gId] = @($newEntry)
         }
     }
     Write-Log "Registry updated with $($groupIds.Count) entries for '$srcName'."
+
+    # ── Resolve target group ID and add to exclusion list ────────────────────
+    # Target groups modified by our sync must be excluded from notification processing
+    # to prevent circular dependency loops (our own writes triggering re-syncs).
+    $tgtGroupObj = Get-GroupByName -Headers $headers -DisplayName $tgtName
+    if ($tgtGroupObj) {
+        $null = $excludedIds.Add($tgtGroupObj.id)
+        Write-Log "Target group '$tgtName' (ID: $($tgtGroupObj.id)) added to exclusion list."
+    } else {
+        Write-Log "Target group '$tgtName' not found in Entra -- exclusion skipped (group may not exist yet)." "WARN"
+    }
 }
 
 # ── Save updated registry ─────────────────────────────────────────────────────
 
-$registry | ConvertTo-Json -Depth 5 | Set-Content -Path $RegistryPath -Encoding UTF8
-Write-Log "Group registry saved to '$RegistryPath' ($($registry.Count) total entries)." "SUCCESS"
+# Embed excluded target group IDs in the registry file under a reserved key
+$registryWithExclusions = @{}
+$registry.Keys | ForEach-Object { $registryWithExclusions[$_] = $registry[$_] }
+$registryWithExclusions['__excludedTargetGroupIds__'] = @($excludedIds)
+
+$registryWithExclusions | ConvertTo-Json -Depth 5 | Set-Content -Path $RegistryPath -Encoding UTF8
+Write-Log "Group registry saved to '$RegistryPath' ($($registry.Count) source entries, $($excludedIds.Count) excluded target IDs)." "SUCCESS"
 
 # ── Load existing subscription store ─────────────────────────────────────────
 

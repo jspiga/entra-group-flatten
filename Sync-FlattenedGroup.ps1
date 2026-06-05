@@ -72,7 +72,7 @@ param(
     [string]$ClientId,
     [string]$ClientSecret,
 
-    [string]$ConfigPath = (Join-Path $PSScriptRoot "config.json"),
+    [string]$ConfigPath = "",
 
     # Where to sync the flattened membership. Defaults to "Entra" if not specified.
     # Use "Atlassian" alone if Entra SCIM provisioning is already active (avoids race conditions).
@@ -83,6 +83,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if (-not $PSScriptRoot) {
+    $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot "config.json" }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

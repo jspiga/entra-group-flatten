@@ -75,7 +75,7 @@ param(
     [string]$ClientId,
     [string]$ClientSecret,
 
-    [string]$ConfigPath    = (Join-Path $PSScriptRoot "config.json"),
+    [string]$ConfigPath    = "",
     [string]$StateFilePath = "",
 
     [switch]$ForceFullSync,
@@ -89,6 +89,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if (-not $PSScriptRoot) {
+    $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot "config.json" }
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -209,16 +214,22 @@ for ($i = 0; $i -lt $SourceGroup.Count; $i++) {
 
     # ── Resolve or create target group ────────────────────────────────────────
 
-    Write-Log "Resolving target group: '$tgtName'"
-    $targetGroupObj  = Get-GroupByName -Headers $headers -DisplayName $tgtName
+    $targetGroupObj   = $null
     $targetGroupIsNew = $false
-    if (-not $targetGroupObj) {
-        Write-Log "Target group '$tgtName' not found -- creating..." "WARN"
-        $targetGroupObj  = New-EntraGroup -Headers $headers -DisplayName $tgtName `
-            -Description "Flattened membership of '$srcName', managed by Invoke-DeltaSync.ps1"
-        $targetGroupIsNew = $true
+
+    if ($syncToEntra) {
+        Write-Log "Resolving target group: '$tgtName'"
+        $targetGroupObj = Get-GroupByName -Headers $headers -DisplayName $tgtName
+        if (-not $targetGroupObj) {
+            Write-Log "Target group '$tgtName' not found -- creating..." "WARN"
+            $targetGroupObj  = New-EntraGroup -Headers $headers -DisplayName $tgtName `
+                -Description "Flattened membership of '$srcName', managed by Invoke-DeltaSync.ps1"
+            $targetGroupIsNew = $true
+        }
+        Write-Log "Target group: '$($targetGroupObj.displayName)' (ID: $($targetGroupObj.id))" "SUCCESS"
+    } else {
+        Write-Log "Skipping Entra target group resolution (not syncing to Entra)." "INFO"
     }
-    Write-Log "Target group: '$($targetGroupObj.displayName)' (ID: $($targetGroupObj.id))" "SUCCESS"
 
     # ── Build per-pair state keys (namespaced by source group name) ───────────
 
@@ -334,25 +345,25 @@ for ($i = 0; $i -lt $SourceGroup.Count; $i++) {
         Write-Log "No change in flattened membership since last run -- target group update skipped." "SUCCESS"
     }
     else {
-        # Verify actual live target membership before mutating (guard against out-of-band changes)
-        Write-Log "Fetching live target group membership for final verification..."
-        $liveMembers = if ($targetGroupIsNew) { @() } else {
-            @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
-        }
+        if ($syncToEntra -and $targetGroupObj) {
+            # Verify actual live target membership before mutating (guard against out-of-band changes)
+            Write-Log "Fetching live target group membership for final verification..."
+            $liveMembers = if ($targetGroupIsNew) { @() } else {
+                @(Get-GroupMembers -Headers $headers -GroupId $targetGroupObj.id)
+            }
 
-        $liveIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($lid in @($liveMembers | Where-Object {
-            $p = $_.PSObject.Properties['@odata.type']; -not $p -or $p.Value -eq '#microsoft.graph.user'
-        } | ForEach-Object { $_.id })) {
-            if ($lid) { $null = $liveIds.Add($lid) }
-        }
+            $liveIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($lid in @($liveMembers | Where-Object {
+                $p = $_.PSObject.Properties['@odata.type']; -not $p -or $p.Value -eq '#microsoft.graph.user'
+            } | ForEach-Object { $_.id })) {
+                if ($lid) { $null = $liveIds.Add($lid) }
+            }
 
-        $liveToAdd    = @($desiredSet | Where-Object { -not $liveIds.Contains($_) })
-        $liveToRemove = @($liveIds    | Where-Object { -not $desiredSet.Contains($_) })
+            $liveToAdd    = @($desiredSet | Where-Object { -not $liveIds.Contains($_) })
+            $liveToRemove = @($liveIds    | Where-Object { -not $desiredSet.Contains($_) })
 
-        Write-Log "Live diff -- Add: $($liveToAdd.Count)  |  Remove: $($liveToRemove.Count)"
+            Write-Log "Live diff -- Add: $($liveToAdd.Count)  |  Remove: $($liveToRemove.Count)"
 
-        if ($syncToEntra) {
             if ($liveToAdd.Count -gt 0) {
                 Write-Log "[Entra] Adding $($liveToAdd.Count) member(s) to '$tgtName'..."
                 Add-GroupMembers -Headers $headers -GroupId $targetGroupObj.id -MemberIds $liveToAdd
@@ -394,6 +405,94 @@ for ($i = 0; $i -lt $SourceGroup.Count; $i++) {
             -DesiredEntraUsers $desiredUserObjects `
             -WhatIf            $false
     }
+}
+
+# ── Rebuild registry to reflect current group hierarchy ──────────────────────
+# After each sync, re-discover which groups are in each source hierarchy.
+# This ensures that if a child group was removed from the hierarchy, its ID
+# (and its descendants' IDs) are no longer mapped to this source group,
+# preventing unnecessary syncs when those orphaned groups change.
+
+$registryPath = Join-Path $PSScriptRoot "state\group-registry.json"
+if (Test-Path $registryPath) {
+    Write-Log "Rebuilding group registry to reflect current hierarchy..."
+
+    # Load existing registry
+    $regRaw = Get-Content $registryPath -Raw | ConvertFrom-Json
+    $reg = @{}
+    $regExcludedIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $regRaw.PSObject.Properties | ForEach-Object {
+        if ($_.Name -eq '__excludedTargetGroupIds__') {
+            foreach ($id in @($_.Value)) { $null = $regExcludedIds.Add($id) }
+        } else {
+            $gId = $_.Name
+            $entries = @()
+            foreach ($item in @($_.Value)) {
+                $e = @{}
+                $item.PSObject.Properties | ForEach-Object { $e[$_.Name] = $_.Value }
+                $entries += $e
+            }
+            $reg[$gId] = $entries
+        }
+    }
+
+    # Process each source group that was synced in this run
+    for ($ri = 0; $ri -lt $SourceGroup.Count; $ri++) {
+        $rSrcName = $SourceGroup[$ri]
+        $rTgtName = Resolve-TargetGroupName -Name $TargetGroup[$ri] -Prefix $prefix
+
+        # Resolve source group ID
+        $rSrcObj = Get-GroupByName -Headers $headers -DisplayName $rSrcName
+        if (-not $rSrcObj) {
+            Write-Log "Registry rebuild: source group '$rSrcName' not found -- skipping." "WARN"
+            continue
+        }
+
+        # Get current hierarchy
+        $currentIds = Get-NestedGroupIds -Headers $headers -GroupId $rSrcObj.id
+        $currentIdSet = [System.Collections.Generic.HashSet[string]]::new(
+            [string[]]$currentIds, [System.StringComparer]::OrdinalIgnoreCase)
+
+        # Remove this source group's mapping from any group IDs no longer in the hierarchy
+        $toClean = @($reg.Keys | Where-Object { -not $currentIdSet.Contains($_) })
+        foreach ($gId in $toClean) {
+            $reg[$gId] = @($reg[$gId] | Where-Object { $_["sourceGroup"] -ne $rSrcName })
+            if ($reg[$gId].Count -eq 0) { $reg.Remove($gId) }
+        }
+
+        # Add/update mappings for all current hierarchy IDs
+        $newEntry = @{ sourceGroup = $rSrcName; targetGroup = $rTgtName }
+        foreach ($gId in $currentIds) {
+            if ($reg.ContainsKey($gId)) {
+                $existing = @($reg[$gId])
+                $alreadyPresent = $existing | Where-Object { $_["sourceGroup"] -eq $rSrcName }
+                if (-not $alreadyPresent) {
+                    $reg[$gId] = $existing + $newEntry
+                }
+            } else {
+                $reg[$gId] = @($newEntry)
+            }
+        }
+
+        # Resolve the target group and ensure its ID is in the exclusion list
+        $rTgtObj = Get-GroupByName -Headers $headers -DisplayName $rTgtName
+        if ($rTgtObj) {
+            if ($regExcludedIds.Add($rTgtObj.id)) {
+                Write-Log "Registry rebuild: target group '$rTgtName' (ID: $($rTgtObj.id)) added to exclusion list."
+            }
+        }
+    }
+
+    # Save updated registry (preserving excluded target group IDs)
+    $regWithExclusions = @{}
+    $reg.Keys | ForEach-Object { $regWithExclusions[$_] = $reg[$_] }
+    $regWithExclusions['__excludedTargetGroupIds__'] = @($regExcludedIds)
+    $regWithExclusions | ConvertTo-Json -Depth 5 | Set-Content -Path $registryPath -Encoding UTF8
+    Write-Log "Group registry rebuilt ($($reg.Count) entries, $($regExcludedIds.Count) excluded target IDs)." "SUCCESS"
+
+    # Signal the listener to reload the registry on next loop iteration
+    $reloadFlagPath = Join-Path $PSScriptRoot "state\.registry-reload"
+    [System.IO.File]::WriteAllText($reloadFlagPath, (Get-Date).ToString("o"))
 }
 
 # ── Persist updated state (once, after all pairs processed) ──────────────────

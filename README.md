@@ -163,29 +163,50 @@ Start-WebhookListener.ps1
     |-- per-source-group debounce (coalesces rapid changes)
 ```
 
-### Step 1 — Register groups and create subscription
+### Step 1 — Start the webhook listener
 
-Run once per source group (or all at once). Pass multiple groups as an array:
+The listener **must be running and publicly reachable** before you register the subscription. Microsoft Graph sends a validation handshake (POST with `?validationToken=...`) to your endpoint when the subscription is created and will reject the subscription if it doesn't receive a valid response.
+
+```powershell
+# Basic (listens on http://localhost:8080/)
+.\Start-WebhookListener.ps1
+
+# Custom port with file logging (recommended)
+.\Start-WebhookListener.ps1 -Port 9090 -LogPath ".\logs\webhook.log"
+
+# All options
+.\Start-WebhookListener.ps1 -Port 8080 -DebounceSecs 60 -LogPath ".\logs\webhook.log"
+```
+
+> **Public HTTPS endpoint required.** Microsoft Graph will only deliver notifications to HTTPS endpoints with a valid TLS certificate. For local development, use a tunnelling tool (e.g. Cloudflare Tunnel) to expose the listener publicly, and set `webhookNotificationUrl` in `config.json` to the tunnel URL.
+
+> **URL ACL (Windows):** By default, `HttpListener` on Windows can only bind to `localhost`. To bind to a public interface, run `Register-UrlAcl.ps1` once as Administrator:
+> ```powershell
+> .\Register-UrlAcl.ps1 -Port 8080
+> ```
+> Without this, the listener falls back to `localhost` automatically.
+
+### Step 2 — Register groups and create subscription
+
+With the listener running, run once per source group (or all at once). Pass multiple groups as an array:
 
 ```powershell
 # Single group
 .\Register-ChangeNotification.ps1 `
     -SourceGroup "All-Engineering" `
-    -TargetGroup "EngineeringFlat" `
-    -NotificationUrl "https://your-endpoint.example.com/notify"
+    -TargetGroup "EngineeringFlat"
 
 # Multiple groups (scales to 100+ with a single subscription)
 .\Register-ChangeNotification.ps1 `
     -SourceGroup "All-Engineering","All-Finance","All-HR" `
-    -TargetGroup "EngineeringFlat","FinanceFlat","HRFlat" `
-    -NotificationUrl "https://your-endpoint.example.com/notify"
+    -TargetGroup "EngineeringFlat","FinanceFlat","HRFlat"
 ```
 
 This creates/updates:
-- `state/group-registry.json` -- maps every group ID in every hierarchy to its source group name
+- `state/group-registry.json` -- maps every group ID in every hierarchy to its source group name, and records target group IDs to prevent circular sync loops
 - `state/subscriptions.json` -- stores the single subscription ID for renewal
 
-Graph subscriptions on `/groups` expire after a maximum of 3 days. Schedule this script to run every 2 days:
+Graph subscriptions on `/groups` expire after a maximum of 3 days. Schedule this script to run every 2 days (ensure the listener is running when the scheduled task fires):
 
 ```powershell
 $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
@@ -194,26 +215,7 @@ $trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Days 2) -
 Register-ScheduledTask -TaskName "EntraGroupFlattenRenew" -Action $action -Trigger $trigger -RunLevel Highest
 ```
 
-### Step 2 — Start the webhook listener
-
-```powershell
-# Basic
-.\Start-WebhookListener.ps1
-
-# Custom port with file logging
-.\Start-WebhookListener.ps1 -Port 9090 -LogPath ".\logs\webhook.log"
-
-# All options
-.\Start-WebhookListener.ps1 -Port 8080 -DebounceSecs 60 -LogPath ".\logs\webhook.log"
-```
-
-The listener automatically reads `state/group-registry.json` to route notifications. To monitor additional groups, re-run `Register-ChangeNotification.ps1` (the listener reloads the registry on each notification).
-
-> For local development, use [ngrok](https://ngrok.com/) to expose the listener publicly:
-> ```powershell
-> ngrok http 8080
-> # Copy the https://... forwarding URL and set webhookNotificationUrl in config.json
-> ```
+The listener automatically reads `state/group-registry.json` to route notifications. After each sync, the registry is automatically rebuilt to reflect any structural changes in the group hierarchy (e.g. child groups being added or removed).
 
 ---
 
@@ -312,7 +314,8 @@ entra-group-flatten/
 ├── Sync-FlattenedGroup.ps1          # Option 1: Full sync (manual / scheduled)
 ├── Invoke-DeltaSync.ps1             # Option 2: Delta query optimised sync
 ├── Register-ChangeNotification.ps1  # Option 3: Create/renew single Graph subscription + build registry
-├── Start-WebhookListener.ps1        # Option 3: HTTP listener -- receives notifications, triggers sync
+├── Register-UrlAcl.ps1              # Option 3: Register HTTP URL ACL so listener can bind to non-localhost (run as Administrator)
+├── Start-WebhookListener.ps1        # Option 3: HTTP listener — receives notifications, triggers sync
 │
 ├── lib/
 │   ├── GraphAuth.ps1                # Shared: OAuth2 client credentials token acquisition + caching
@@ -321,10 +324,79 @@ entra-group-flatten/
 │   └── AtlassianScim.ps1            # Optional: Atlassian SCIM 2.0 group provisioning (-SyncTo Atlassian)
 │
 └── state/                           # Auto-created at runtime
-    ├── group-state.json             # Option 2: Delta link + member snapshot store
+    ├── group-state.json             # Option 2/3: Delta link + member snapshot store
     ├── group-registry.json          # Option 3: Group ID -> source group mapping (built by Register-ChangeNotification.ps1)
     └── subscriptions.json           # Option 3: Active subscription ID store
 ```
+
+### State File Schemas
+
+These files are useful for troubleshooting Option 2/3 behaviour.
+
+#### `state/group-registry.json`
+
+Maps every Entra group ID in every monitored hierarchy to its source/target group pair(s). Also records target group IDs that should be ignored to prevent circular sync loops.
+
+```json
+{
+  "<group-guid>": [
+    {
+      "sourceGroup": "All-Engineering",
+      "targetGroup": "EngineeringFlat"
+    }
+  ],
+  "<child-group-guid>": [
+    {
+      "sourceGroup": "All-Engineering",
+      "targetGroup": "EngineeringFlat"
+    },
+    {
+      "sourceGroup": "All-Staff",
+      "targetGroup": "StaffFlat"
+    }
+  ],
+  "__excludedTargetGroupIds__": [
+    "<target-group-guid>",
+    "<another-target-group-guid>"
+  ]
+}
+```
+
+- Each group GUID key maps to an **array** of source/target pairs — a child group can belong to multiple source hierarchies simultaneously
+- `__excludedTargetGroupIds__` lists target group GUIDs — notifications for these groups are silently ignored to prevent the listener from re-processing its own writes
+- The registry is automatically rebuilt after each sync to reflect structural changes (e.g. child groups added or removed from the hierarchy)
+
+**Troubleshooting:** If a notification is logged as "not in registry — ignoring", verify the group's GUID appears as a key in this file. If it doesn't, re-run `Register-ChangeNotification.ps1` to rebuild the registry.
+
+#### `state/group-state.json`
+
+Stores the delta link and flattened member snapshot for each source group. Used by `Invoke-DeltaSync.ps1` (Options 2 and 3) to perform incremental syncs.
+
+```json
+{
+  "deltaLinks": {
+    "All-Engineering": "https://graph.microsoft.com/v1.0/groups/<id>/members/delta?$deltatoken=..."
+  },
+  "trackedMembers": {
+    "All-Engineering": {
+      "<user-object-id>": {
+        "id": "<user-object-id>",
+        "displayName": "Jane Smith",
+        "userPrincipalName": "jsmith@contoso.com"
+      }
+    },
+    "All-Engineering__target": {
+      "<user-object-id>": true
+    }
+  }
+}
+```
+
+- `deltaLinks` — the Graph delta token for each source group; used to fetch only changes since the last sync. Delete this key (or the entire file) to force a full re-sync.
+- `trackedMembers.<sourceGroup>` — the last-known flattened membership snapshot (user objects with UPN). Used to compute add/remove diffs.
+- `trackedMembers.<sourceGroup>__target` — the last-known target group membership (user IDs only). Used to guard against out-of-band changes to the target group.
+
+**Troubleshooting:** If membership appears out of sync, delete `group-state.json` to force a full re-sync on the next notification or manual run.
 
 ---
 

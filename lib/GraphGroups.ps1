@@ -563,7 +563,9 @@ function Get-GroupMembersDelta {
         [string]$DeltaLink = $null
     )
 
-    $startUri = if ($DeltaLink) { $DeltaLink } else { "$script:GraphBaseUrl/groups/$GroupId/members/microsoft.graph.user/delta" }
+    # Request userPrincipalName explicitly -- the delta endpoint only returns id/@odata.type by default,
+    # which is insufficient for Atlassian SCIM lookups that need UPN to match users.
+    $startUri = if ($DeltaLink) { $DeltaLink } else { "$script:GraphBaseUrl/groups/$GroupId/members/microsoft.graph.user/delta?`$select=id,displayName,userPrincipalName" }
 
     $allChanges = [System.Collections.Generic.List[object]]::new()
     $nextUri    = $startUri
